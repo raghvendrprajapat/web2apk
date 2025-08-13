@@ -22,6 +22,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,52 +38,72 @@ jobs:
         with:
           node-version: "20"
 
+      # ----- Project & Capacitor deps -----
       - name: Ensure Node project & Capacitor deps
         run: |
           if [ ! -f package.json ]; then npm init -y; fi
           npm i @capacitor/core @capacitor/cli @capacitor/android
           mkdir -p dist
-          echo '<!doctype html><html><body>Web2APK</body></html>' > dist/index.html
+          echo "<!doctype html><meta charset='utf-8'><title>Web2APK</title><body>Web2APK</body>" > dist/index.html
 
+      # ----- Capacitor config -----
       - name: Initialize/Update Capacitor config
         run: |
-          if [ ! -f capacitor.config.json ]; then
-            npx cap init "${{ github.event.inputs.APP_NAME }}" "${{ github.event.inputs.APP_ID }}" --web-dir=dist --skip-dependencies
-          fi
           node -e "
-            const fs=require('fs'); const p='capacitor.config.json';
-            const j=fs.existsSync(p)?JSON.parse(fs.readFileSync(p,'utf8')):{};
-            j.appId='${{ github.event.inputs.APP_ID }}';
-            j.appName='${{ github.event.inputs.APP_NAME }}';
-            j.webDir='dist';
-            j.server=j.server||{};
-            j.server.url='${{ github.event.inputs.WEB_URL }}';
-            j.android=j.android||{allowMixedContent:true};
-            fs.writeFileSync(p,JSON.stringify(j,null,2));
+            const fs=require('fs');
+            const cfg={
+              appId: '${{ github.event.inputs.APP_ID }}',
+              appName: '${{ github.event.inputs.APP_NAME }}',
+              webDir: 'dist',
+              server: { url: '${{ github.event.inputs.WEB_URL }}', androidScheme: 'https', cleartext: false },
+              android: { allowMixedContent: true }
+            };
+            fs.writeFileSync('capacitor.config.json', JSON.stringify(cfg,null,2));
           "
-
-      - name: Add Android & Sync
-        run: |
           npx cap add android || true
           npx cap sync android
 
+      # ----- Decode keystore from secret -----
       - name: Decode keystore
-        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > my-release-key.jks
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > android/my-release-key.jks
 
+      # ----- Build (signed) -----
       - name: Build (release, signed)
         working-directory: android
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
           ./gradlew clean
-          ./gradlew assembleRelease bundleRelease \
-            -Pandroid.injected.signing.store.file=../my-release-key.jks \
-            -Pandroid.injected.signing.store.password=${{ secrets.KEYSTORE_PASSWORD }} \
-            -Pandroid.injected.signing.key.alias=${{ secrets.KEY_ALIAS }} \
-            -Pandroid.injected.signing.key.password=${{ secrets.KEY_PASSWORD }}
+          ./gradlew assembleRelease \
+            -Pandroid.injected.signing.store.file=my-release-key.jks \
+            -Pandroid.injected.signing.store.password="${KEYSTORE_PASSWORD}" \
+            -Pandroid.injected.signing.key.alias="${KEY_ALIAS}" \
+            -Pandroid.injected.signing.key.password="${KEY_PASSWORD}"
+          ./gradlew bundleRelease \
+            -Pandroid.injected.signing.store.file=my-release-key.jks \
+            -Pandroid.injected.signing.store.password="${KEYSTORE_PASSWORD}" \
+            -Pandroid.injected.signing.key.alias="${KEY_ALIAS}" \
+            -Pandroid.injected.signing.key.password="${KEY_PASSWORD}"
 
+      # ----- Upload outputs -----
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: android-release
           path: |
-            app/build/outputs/apk/release/*.apk
-            app/build/outputs/bundle/release/*.aab
+            android/app/build/outputs/apk/release/*.apk
+            android/app/build/outputs/bundle/release/*.aab
+
+      # ----- Optional: callback to Make.com -----
+      - name: Callback to Make.com
+        if: ${{ inputs.CALLBACK_URL != '' }}
+        run: |
+          echo "Sending callback to Make.com..."
+          curl -X POST -H "Content-Type: application/json" \
+            -d '{"repo":"${{ github.repository }}","run_id":"${{ github.run_id }}"}' \
+            "${{ github.event.inputs.CALLBACK_URL }}"
