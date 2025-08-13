@@ -30,21 +30,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Java 21 is required by recent Android Gradle Plugin
-      - name: Setup Java 21
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-          cache: gradle
-
       - name: Setup Node 20
         uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: "npm"
 
-      # Install Android SDK + build-tools on the runner
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
@@ -53,7 +44,6 @@ jobs:
             platforms;android-34
             build-tools;34.0.0
 
-      # Ensure a Node project & Capacitor deps exist
       - name: Ensure Node project & Capacitor deps
         run: |
           if [ ! -f package.json ]; then
@@ -66,7 +56,6 @@ jobs:
             echo "<!doctype html><title>Web2APK</title>" > dist/index.html
           fi
 
-      # Create capacitor.config.json if missing
       - name: Generate Capacitor config (if missing)
         env:
           APP_NAME: ${{ github.event.inputs.APP_NAME }}
@@ -82,18 +71,24 @@ jobs:
           npx cap add android || true
           npx cap sync android
 
-      # ---- Signing: expect secrets to be present ----
-      # KEYS:  KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD
+      # >>>> यहाँ पर अब Java सेट करें (Gradle फाइलें मौजूद हैं)
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      # ---- Signing: expect secrets present ----
+      # KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD
       - name: Decode keystore from secret
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         shell: bash
         run: |
           mkdir -p android
-          # write bytes exactly as-is; works even if secret has newlines
           printf '%s' "$KEYSTORE_BASE64" | base64 -d > android/my-release-key.jks
 
-      # Optional sanity check so we fail early if keystore is wrong
       - name: Verify keystore
         working-directory: android
         run: |
@@ -122,7 +117,6 @@ jobs:
             android/app/build/outputs/apk/release/*.apk
             android/app/build/outputs/bundle/release/*.aab
 
-      # Optional: callback to Make.com if URL provided
       - name: Callback to Make.com (optional)
         if: ${{ github.event.inputs.CALLBACK_URL != '' }}
         run: |
