@@ -12,129 +12,231 @@ on:
         required: true
         default: "com.example.web2apk"
       WEB_URL:
-        description: "Web App URL (https://...)"
+        description: "Web App URL"
         required: true
         default: "https://example.com"
-      CALLBACK_URL:
-        description: "Make.com callback webhook URL (optional)"
+      APP_VERSION:
+        description: "App Version"
         required: false
+        default: "1.0.0"
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Java 21
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: "17"
 
-      - name: Setup Node 20
+      - name: Setup Node 18
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          # जानबूझकर cache नहीं — lock file न होने पर error आता है
+          node-version: "18"
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
-        with:
-          sdk-version: "latest"
 
-      # ------- Node/Capacitor project ensure -------
-      - name: Ensure Node project & Capacitor deps
+      - name: Setup basic project structure
         run: |
+          # Create package.json if not exists
           if [ ! -f package.json ]; then
             npm init -y
           fi
+          
+          # Install Capacitor dependencies
+          npm install @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest --save
+          
+          # Create web directory and basic HTML with proper variable substitution
+          mkdir -p src
+          envsubst < <(cat << 'EOF'
+          <!doctype html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+            <title>$APP_NAME</title>
+            <style>
+              body, html { margin: 0; padding: 0; height: 100%; overflow: hidden; }
+              #webview { width: 100vw; height: 100vh; border: none; }
+              .loading { 
+                position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+                font-family: Arial; color: #666; z-index: 1000;
+              }
+            </style>
+          </head>
+          <body>
+            <div class="loading">Loading $APP_NAME...</div>
+            <iframe id="webview" src="$WEB_URL" 
+                    onload="document.querySelector('.loading').style.display='none'"
+                    onerror="document.querySelector('.loading').innerHTML='Failed to load app'">
+            </iframe>
+          </body>
+          </html>
+          EOF
+          ) > src/index.html
+        env:
+          APP_NAME: ${{ github.event.inputs.APP_NAME }}
+          WEB_URL: ${{ github.event.inputs.WEB_URL }}
 
-          # Capacitor core + CLI
-          npm i @capacitor/core @capacitor/cli --save
-
-          # webDir के लिए छोटी placeholder site (अगर dist नहीं है)
-          mkdir -p dist
-          if [ ! -f dist/index.html ]; then
-            cat > dist/index.html <<'HTML'
-            <!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-            <title>Web2APK</title></head><body><h1>Web2APK</h1><p>Build placeholder.</p></body></html>
-            HTML
-          fi
-
-      - name: Generate/Update Capacitor config
+      - name: Generate Capacitor config
         run: |
           node -e '
             const fs = require("fs");
-            const cfgPath = "capacitor.config.json";
-            const cfg = fs.existsSync(cfgPath) ? JSON.parse(fs.readFileSync(cfgPath,"utf8")) : {};
-            cfg.appId    = process.env.APP_ID;
-            cfg.appName  = process.env.APP_NAME;
-            cfg.webDir   = "dist";
-            cfg.server   = { url: process.env.WEB_URL, cleartext: true, androidScheme: "https" };
-            // कुछ वेबव्यूज़ के लिए allowMixedContent:
-            cfg.android  = { allowMixedContent: true };
-            fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+            const cfg = {
+              appId: process.env.APP_ID,
+              appName: process.env.APP_NAME,
+              webDir: "src",
+              bundledWebRuntime: false,
+              server: { 
+                url: process.env.WEB_URL, 
+                cleartext: true,
+                allowNavigation: ["*"]
+              },
+              plugins: {
+                SplashScreen: { 
+                  launchShowDuration: 2000,
+                  backgroundColor: "#ffffff"
+                },
+                StatusBar: {
+                  backgroundColor: "#ffffff"
+                }
+              },
+              android: {
+                allowMixedContent: true,
+                captureInput: true,
+                webContentsDebuggingEnabled: false
+              }
+            };
+            fs.writeFileSync("capacitor.config.json", JSON.stringify(cfg, null, 2));
+            console.log("✅ Capacitor config created");
           '
         env:
           APP_NAME: ${{ github.event.inputs.APP_NAME }}
-          APP_ID:   ${{ github.event.inputs.APP_ID }}
-          WEB_URL:  ${{ github.event.inputs.WEB_URL }}
+          APP_ID: ${{ github.event.inputs.APP_ID }}
+          WEB_URL: ${{ github.event.inputs.WEB_URL }}
 
-      - name: Add Android & Sync
+      - name: Add Android platform
         run: |
-          npx cap add android || true
-          npx cap sync android
+          npx cap add android
+          echo "✅ Android platform added"
 
-      # ------- Signing keystore from secret -------
+      - name: Sync Capacitor
+        run: |
+          npx cap sync android
+          echo "✅ Capacitor synced"
+
       - name: Decode keystore from secret
         run: |
+          if [ -z "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "❌ KEYSTORE_BASE64 secret not found"
+            echo "Please add keystore secrets in repository settings"
+            exit 1
+          fi
           mkdir -p android
-          echo "${KEYSTORE_BASE64}" | base64 -d > android/my-release-key.jks
-          ls -lh android/my-release-key.jks
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android/my-release-key.jks
+          
+          # Verify keystore file
+          if [ ! -f android/my-release-key.jks ]; then
+            echo "❌ Failed to create keystore file"
+            exit 1
+          fi
+          
+          echo "✅ Keystore decoded successfully"
 
-      - name: Verify keystore (alias & passwords)
+      - name: Update app version in build.gradle
         run: |
-          keytool -list -v \
-            -keystore android/my-release-key.jks \
-            -storepass "${{ secrets.KEYSTORE_PASSWORD }}" \
-            -alias "${{ secrets.KEY_ALIAS }}" \
-            -keypass "${{ secrets.KEY_PASSWORD }}"
+          # Update version name and code
+          sed -i "s/versionName \"1.0\"/versionName \"${{ github.event.inputs.APP_VERSION }}\"/" android/app/build.gradle
+          sed -i "s/versionCode 1/versionCode $(date +%Y%m%d%H | tail -c 8)/" android/app/build.gradle
+          
+          # Verify changes
+          grep -n "versionName\|versionCode" android/app/build.gradle
+          echo "✅ Version updated"
 
-      # ------- Build (signed) -------
-      - name: Build (release, signed)
+      - name: Build signed APK & AAB
         working-directory: android
         run: |
           chmod +x ./gradlew
+          
+          # Clean previous builds
           ./gradlew clean
-
-          # Gradle properties से inject करके sign करें
-          ./gradlew assembleRelease \
-            -Pandroid.injected.signing.store.file="$PWD/my-release-key.jks" \
+          
+          # Build both APK and AAB with signing
+          ./gradlew assembleRelease bundleRelease \
+            -Pandroid.injected.signing.store.file=$PWD/my-release-key.jks \
             -Pandroid.injected.signing.store.password="${{ secrets.KEYSTORE_PASSWORD }}" \
             -Pandroid.injected.signing.key.alias="${{ secrets.KEY_ALIAS }}" \
-            -Pandroid.injected.signing.key.password="${{ secrets.KEY_PASSWORD }}"
+            -Pandroid.injected.signing.key.password="${{ secrets.KEY_PASSWORD }}" \
+            --stacktrace --info
+          
+          echo "✅ Build completed"
 
-          ./gradlew bundleRelease \
-            -Pandroid.injected.signing.store.file="$PWD/my-release-key.jks" \
-            -Pandroid.injected.signing.store.password="${{ secrets.KEYSTORE_PASSWORD }}" \
-            -Pandroid.injected.signing.key.alias="${{ secrets.KEY_ALIAS }}" \
-            -Pandroid.injected.signing.key.password="${{ secrets.KEY_PASSWORD }}"
+      - name: Verify build outputs
+        run: |
+          echo "Checking build outputs..."
+          
+          # Check APK
+          if [ -f "android/app/build/outputs/apk/release/app-release.apk" ]; then
+            echo "✅ APK created successfully"
+            APK_SIZE=$(ls -lh android/app/build/outputs/apk/release/app-release.apk | awk '{print $5}')
+            echo "APK Size: $APK_SIZE"
+          else
+            echo "❌ APK not found"
+            ls -la android/app/build/outputs/apk/release/ || echo "Directory not found"
+          fi
+          
+          # Check AAB
+          if [ -f "android/app/build/outputs/bundle/release/app-release.aab" ]; then
+            echo "✅ AAB created successfully"
+            AAB_SIZE=$(ls -lh android/app/build/outputs/bundle/release/app-release.aab | awk '{print $5}')
+            echo "AAB Size: $AAB_SIZE"
+          else
+            echo "❌ AAB not found"
+            ls -la android/app/build/outputs/bundle/release/ || echo "Directory not found"
+          fi
 
-      - name: Upload artifacts
+      - name: Upload Release Artifacts
         uses: actions/upload-artifact@v4
+        if: success()
         with:
-          name: android-release
+          name: android-release-${{ github.event.inputs.APP_NAME }}-v${{ github.event.inputs.APP_VERSION }}
           path: |
             android/app/build/outputs/apk/release/*.apk
             android/app/build/outputs/bundle/release/*.aab
+          retention-days: 7
 
-      - name: Callback to Make.com (optional)
-        if: ${{ github.event.inputs.CALLBACK_URL != '' }}
+      - name: Create Release Summary
+        if: always()
         run: |
-          curl -sS -X POST "${{ github.event.inputs.CALLBACK_URL }}" \
-            -H "Content-Type: application/json" \
-            -d "{\"run_id\":\"${GITHUB_RUN_ID}\",\"repo\":\"${GITHUB_REPOSITORY}\",\"url\":\"https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"}"
+          echo "## 🎉 Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **App Name:** ${{ github.event.inputs.APP_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Package ID:** ${{ github.event.inputs.APP_ID }}" >> $GITHUB_STEP_SUMMARY  
+          echo "- **Web URL:** ${{ github.event.inputs.WEB_URL }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version:** ${{ github.event.inputs.APP_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build Time:** $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📱 Files Generated:" >> $GITHUB_STEP_SUMMARY
+          
+          # Check what files were actually created
+          if [ -f "android/app/build/outputs/apk/release/app-release.apk" ]; then
+            echo "- ✅ APK (for direct install)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- ❌ APK (failed)" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -f "android/app/build/outputs/bundle/release/app-release.aab" ]; then
+            echo "- ✅ AAB (for Play Store)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- ❌ AAB (failed)" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📥 Download:" >> $GITHUB_STEP_SUMMARY
+          echo "Check the 'Artifacts' section below to download your files." >> $GITHUB_STEP_SUMMARY
