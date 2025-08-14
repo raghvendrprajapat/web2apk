@@ -21,30 +21,27 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1) Repo checkout
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2) Java 17 (Android Gradle Plugin के साथ सबसे compatible)
-      - name: Setup Java 17
+      # ⬇️ JDK 21 (AGP/Capacitor अब 21 सोर्स सेट कर रहे हैं)
+      - name: Setup Java 21
+        id: jdk
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: "21"
 
-      # 3) Node 20 (बिना cache, ताकि lockfile error न आये)
       - name: Setup Node 20
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      # 4) Android SDK (latest cmdline-tools; कोई deprecated input नहीं)
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
           cmdline-tools-version: "latest"
 
-      # 5) न्यूनतम Node प्रोजेक्ट और Capacitor deps
       - name: Ensure Node project & Capacitor deps
         run: |
           if [ ! -f package.json ]; then
@@ -54,7 +51,6 @@ jobs:
           mkdir -p dist
           echo '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Web2APK</title></head><body><h1>Web2APK</h1></body></html>' > dist/index.html
 
-      # 6) capacitor.config.json बनाओ (inputs से)
       - name: Generate Capacitor config
         run: |
           node -e '
@@ -72,13 +68,11 @@ jobs:
           APP_ID:   ${{ github.event.inputs.APP_ID }}
           WEB_URL:  ${{ github.event.inputs.WEB_URL }}
 
-      # 7) Android platform add + sync
       - name: Add Android & Sync
         run: |
           npx cap add android || true
           npx cap sync android
 
-      # 8) Keystore decode (Secret: KEYSTORE_BASE64)
       - name: Decode keystore from secret
         run: |
           mkdir -p android
@@ -86,7 +80,6 @@ jobs:
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
 
-      # 9) Keystore verify (गलत alias/pass हो तो यहीं पकड़ लो)
       - name: Verify keystore (alias & passwords)
         run: |
           keytool -list -v \
@@ -95,10 +88,13 @@ jobs:
             -alias "${{ secrets.KEY_ALIAS }}" \
             -keypass "${{ secrets.KEY_PASSWORD }}"
 
-      # 10) Signed build (APK + AAB)
       - name: Build (release, signed)
         working-directory: android
+        env:
+          JAVA_HOME: ${{ steps.jdk.outputs.path }}   # ⬅️ Gradle को JDK 21 फोर्स
         run: |
+          echo "Using JAVA_HOME=$JAVA_HOME"
+          java -version
           chmod +x ./gradlew
           ./gradlew clean
           ./gradlew assembleRelease bundleRelease \
@@ -107,7 +103,6 @@ jobs:
             -Pandroid.injected.signing.key.alias="${{ secrets.KEY_ALIAS }}" \
             -Pandroid.injected.signing.key.password="${{ secrets.KEY_PASSWORD }}"
 
-      # 11) Artifacts upload
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
