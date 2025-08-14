@@ -18,96 +18,111 @@ on:
       CALLBACK_URL:
         description: "Make.com callback webhook URL (optional)"
         required: false
-        default: ""
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      NODE_OPTIONS: --max-old-space-size=4096
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
       - name: Setup Node 20
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: "npm"
+          # जानबूझकर cache नहीं — lock file न होने पर error आता है
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: |
-            platform-tools
-            platforms;android-34
-            build-tools;34.0.0
+          sdk-version: "latest"
 
+      # ------- Node/Capacitor project ensure -------
       - name: Ensure Node project & Capacitor deps
         run: |
           if [ ! -f package.json ]; then
             npm init -y
           fi
-          npm i -E @capacitor/cli @capacitor/core
-          npm i -D -E @capacitor/android
+
+          # Capacitor core + CLI
+          npm i @capacitor/core @capacitor/cli --save
+
+          # webDir के लिए छोटी placeholder site (अगर dist नहीं है)
           mkdir -p dist
           if [ ! -f dist/index.html ]; then
-            echo "<!doctype html><title>Web2APK</title>" > dist/index.html
+            cat > dist/index.html <<'HTML'
+            <!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+            <title>Web2APK</title></head><body><h1>Web2APK</h1><p>Build placeholder.</p></body></html>
+            HTML
           fi
 
-      - name: Generate Capacitor config (if missing)
+      - name: Generate/Update Capacitor config
+        run: |
+          node -e '
+            const fs = require("fs");
+            const cfgPath = "capacitor.config.json";
+            const cfg = fs.existsSync(cfgPath) ? JSON.parse(fs.readFileSync(cfgPath,"utf8")) : {};
+            cfg.appId    = process.env.APP_ID;
+            cfg.appName  = process.env.APP_NAME;
+            cfg.webDir   = "dist";
+            cfg.server   = { url: process.env.WEB_URL, cleartext: true, androidScheme: "https" };
+            // कुछ वेबव्यूज़ के लिए allowMixedContent:
+            cfg.android  = { allowMixedContent: true };
+            fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+          '
         env:
           APP_NAME: ${{ github.event.inputs.APP_NAME }}
           APP_ID:   ${{ github.event.inputs.APP_ID }}
           WEB_URL:  ${{ github.event.inputs.WEB_URL }}
-        run: |
-          if [ ! -f capacitor.config.json ] && [ ! -f capacitor.config.ts ]; then
-            node -e "const fs=require('fs');const c={appId:process.env.APP_ID,appName:process.env.APP_NAME,webDir:'dist',server:{url:process.env.WEB_URL,androidScheme:'https',cleartext:false,allowNavigation:[process.env.WEB_URL]}};fs.writeFileSync('capacitor.config.json',JSON.stringify(c,null,2));"
-          fi
 
       - name: Add Android & Sync
         run: |
           npx cap add android || true
           npx cap sync android
 
-      # >>>> यहाँ पर अब Java सेट करें (Gradle फाइलें मौजूद हैं)
-      - name: Setup Java 21
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-          cache: gradle
-
-      # ---- Signing: expect secrets present ----
-      # KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD
+      # ------- Signing keystore from secret -------
       - name: Decode keystore from secret
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-        shell: bash
         run: |
           mkdir -p android
-          printf '%s' "$KEYSTORE_BASE64" | base64 -d > android/my-release-key.jks
+          echo "${KEYSTORE_BASE64}" | base64 -d > android/my-release-key.jks
+          ls -lh android/my-release-key.jks
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
 
-      - name: Verify keystore
-        working-directory: android
+      - name: Verify keystore (alias & passwords)
         run: |
-          keytool -list -keystore my-release-key.jks -storepass "${{ secrets.KEYSTORE_PASSWORD }}" >/dev/null
+          keytool -list -v \
+            -keystore android/my-release-key.jks \
+            -storepass "${{ secrets.KEYSTORE_PASSWORD }}" \
+            -alias "${{ secrets.KEY_ALIAS }}" \
+            -keypass "${{ secrets.KEY_PASSWORD }}"
 
+      # ------- Build (signed) -------
       - name: Build (release, signed)
         working-directory: android
         run: |
+          chmod +x ./gradlew
           ./gradlew clean
+
+          # Gradle properties से inject करके sign करें
           ./gradlew assembleRelease \
-            -Pandroid.injected.signing.store.file=$PWD/my-release-key.jks \
-            -Pandroid.injected.signing.store.password='${{ secrets.KEYSTORE_PASSWORD }}' \
-            -Pandroid.injected.signing.key.alias='${{ secrets.KEY_ALIAS }}' \
-            -Pandroid.injected.signing.key.password='${{ secrets.KEY_PASSWORD }}'
+            -Pandroid.injected.signing.store.file="$PWD/my-release-key.jks" \
+            -Pandroid.injected.signing.store.password="${{ secrets.KEYSTORE_PASSWORD }}" \
+            -Pandroid.injected.signing.key.alias="${{ secrets.KEY_ALIAS }}" \
+            -Pandroid.injected.signing.key.password="${{ secrets.KEY_PASSWORD }}"
+
           ./gradlew bundleRelease \
-            -Pandroid.injected.signing.store.file=$PWD/my-release-key.jks \
-            -Pandroid.injected.signing.store.password='${{ secrets.KEYSTORE_PASSWORD }}' \
-            -Pandroid.injected.signing.key.alias='${{ secrets.KEY_ALIAS }}' \
-            -Pandroid.injected.signing.key.password='${{ secrets.KEY_PASSWORD }}'
+            -Pandroid.injected.signing.store.file="$PWD/my-release-key.jks" \
+            -Pandroid.injected.signing.store.password="${{ secrets.KEYSTORE_PASSWORD }}" \
+            -Pandroid.injected.signing.key.alias="${{ secrets.KEY_ALIAS }}" \
+            -Pandroid.injected.signing.key.password="${{ secrets.KEY_PASSWORD }}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -122,4 +137,4 @@ jobs:
         run: |
           curl -sS -X POST "${{ github.event.inputs.CALLBACK_URL }}" \
             -H "Content-Type: application/json" \
-            -d "{\"repo\":\"${GITHUB_REPOSITORY}\",\"run_id\":${GITHUB_RUN_ID}}"
+            -d "{\"run_id\":\"${GITHUB_RUN_ID}\",\"repo\":\"${GITHUB_REPOSITORY}\",\"url\":\"https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"}"
