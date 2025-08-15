@@ -16,7 +16,7 @@ on:
         required: true
         default: "https://example.com"
       CALLBACK_URL:
-        description: "Make.com callback webhook URL (optional, use secret MAKE_WEBHOOK_URL)"
+        description: "Make.com callback webhook URL (optional)"
         required: false
         default: ""
 
@@ -24,13 +24,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      # Keystore secrets (already saved by you)
       KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
       KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
       KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
       KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-
-      # Optional: webhook via secret (recommended)
       MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
 
     steps:
@@ -53,7 +50,7 @@ jobs:
         with:
           accept-android-sdk-licenses: true
 
-      # ---------- Node + Capacitor (same logic you used earlier) ----------
+      # --------- Project deps (unchanged build logic) ---------
       - name: Ensure Node project & Capacitor deps
         shell: bash
         run: |
@@ -66,28 +63,28 @@ jobs:
           }
           JSON
           fi
-
           npm i -g @capacitor/cli
           npm i @capacitor/core @capacitor/android --save-exact
-
-          mkdir -p dist && echo '<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1"><title>Web2APK</title><iframe src="${{ github.event.inputs.WEB_URL }}" style="border:0;position:fixed;inset:0;width:100%;height:100%"></iframe>' > dist/index.html
+          mkdir -p dist
+          # Minimal placeholder; main content loads via server.url below
+          echo '<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1"><title>Web2APK</title><iframe src="${{ github.event.inputs.WEB_URL }}" style="border:0;position:fixed;inset:0;width:100%;height:100%"></iframe>' > dist/index.html
 
       - name: Generate/Update Capacitor config
         shell: bash
         run: |
           node - <<'NODE'
-          const fs = require('fs')
-          const appName = `${process.env.GITHUB_EVENT_PATH ? JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH)).inputs.APP_NAME : ''}` || process.env.APP_NAME || "${{ github.event.inputs.APP_NAME }}"
-          const appId   = "${{ github.event.inputs.APP_ID }}"
-          const webUrl  = "${{ github.event.inputs.WEB_URL }}"
+          const fs = require('fs');
+          const appName = "${{ github.event.inputs.APP_NAME }}";
+          const appId   = "${{ github.event.inputs.APP_ID }}";
+          const webUrl  = "${{ github.event.inputs.WEB_URL }}";
           const cfg = {
             appId: appId,
             appName: appName,
             webDir: "dist",
-            server: { url: webUrl, androidScheme: "https" },
+            server: { url: webUrl, androidScheme: "https", cleartext: true },
             android: { allowMixedContent: true }
-          }
-          fs.writeFileSync('capacitor.config.json', JSON.stringify(cfg, null, 2))
+          };
+          fs.writeFileSync('capacitor.config.json', JSON.stringify(cfg, null, 2));
           NODE
 
       - name: Add Android & Sync
@@ -96,7 +93,7 @@ jobs:
           npx cap add android || true
           npx cap sync android
 
-      # ---------- Signing: decode & verify ----------
+      # --------- Signing (unchanged) ---------
       - name: Decode keystore from secret
         shell: bash
         run: |
@@ -106,68 +103,68 @@ jobs:
       - name: Verify keystore (alias & passwords)
         shell: bash
         run: |
-          keytool -list -v -keystore android/my-release-key.jks -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" -keypass "$KEY_PASSWORD" >/dev/null
+          keytool -list -v -keystore android/my-release-key.jks \
+            -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" -keypass "$KEY_PASSWORD" >/dev/null
 
-      # ---------- Build (release, signed) ----------
+      # --------- Build (unchanged) ---------
       - name: Build (release, signed)
         working-directory: android
         shell: bash
         run: |
           chmod +x ./gradlew
           ./gradlew clean
-
-          # Pass signing creds via Gradle properties variables
           ./gradlew assembleRelease \
             -Pandroid.injected.signing.store.file=$PWD/my-release-key.jks \
             -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
             -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
             -Pandroid.injected.signing.key.password="$KEY_PASSWORD"
-
           ./gradlew bundleRelease \
             -Pandroid.injected.signing.store.file=$PWD/my-release-key.jks \
             -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
             -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
             -Pandroid.injected.signing.key.password="$KEY_PASSWORD"
 
-      # ---------- Upload artifacts ----------
-      - name: Upload artifacts
+      # --------- Upload artifacts (SEPARATE) ---------
+      - name: Upload APK (signed)
         uses: actions/upload-artifact@v4
         with:
-          name: android-release
-          path: |
-            android/app/build/outputs/apk/release/*.apk
-            android/app/build/outputs/bundle/release/*.aab
-          if-no-files-found: warn
+          name: app-release-apk
+          path: android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
           retention-days: 7
 
-      # ---------- Make.com callback (NEW) ----------
+      - name: Upload AAB (signed)
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-aab
+          path: android/app/build/outputs/bundle/release/*.aab
+          if-no-files-found: error
+          retention-days: 7
+
+      # --------- Optional Make.com callback (unchanged logic) ---------
       - name: Callback to Make.com
         if: always()
         shell: bash
         run: |
-          # Prefer secret; else take manual input CALLBACK_URL if provided
           URL="${MAKE_WEBHOOK_URL}"
           if [ -z "$URL" ] && [ -n "${{ github.event.inputs.CALLBACK_URL }}" ]; then
             URL="${{ github.event.inputs.CALLBACK_URL }}"
           fi
 
           if [ -n "$URL" ]; then
-            # Try to fetch latest artifact download page
             RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             STATUS="${{ job.status }}"
             APP_NAME='${{ github.event.inputs.APP_NAME }}'
             PKG_ID='${{ github.event.inputs.APP_ID }}'
             WEB_URL='${{ github.event.inputs.WEB_URL }}'
+            # Artifact names (separate)
+            APK_ARTIFACT="app-release-apk"
+            AAB_ARTIFACT="app-release-aab"
 
-            curl -X POST -H "Content-Type: application/json" \
-              -d "$(jq -n \
-                    --arg status "$STATUS" \
-                    --arg app_name "$APP_NAME" \
-                    --arg package_id "$PKG_ID" \
-                    --arg web_url "$WEB_URL" \
-                    --arg run_url "$RUN_URL" \
-                    '{status:$status, app_name:$app_name, package_id:$package_id, web_url:$web_url, artifacts:$run_url}')" \
-              "$URL"
+            PAYLOAD=$(printf '{"status":"%s","app_name":"%s","package_id":"%s","web_url":"%s","run_url":"%s","apk_artifact":"%s","aab_artifact":"%s"}' \
+              "$STATUS" "$APP_NAME" "$PKG_ID" "$WEB_URL" "$RUN_URL" "$APK_ARTIFACT" "$AAB_ARTIFACT")
+
+            curl -sS -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$URL" || true
           else
-            echo "No Make.com webhook URL provided (secret MAKE_WEBHOOK_URL or input CALLBACK_URL). Skipping callback."
+            echo "No Make.com webhook URL provided. Skipping callback."
           fi
