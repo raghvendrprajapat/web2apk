@@ -1,247 +1,171 @@
-name: Build TWA (Play-ready AAB + universal APK)
+name: Build Android (Signed APK & AAB)
 
 on:
-  workflow_dispatch:
-    inputs:
-      APP_NAME:
-        description: "App name (launcher label)"
-        required: true
-        default: "My TWA App"
-      PACKAGE_ID:
-        description: "Android package ID (e.g., com.example.app)"
-        required: true
-        default: "com.example.twa"
-      START_URL:
-        description: "Start URL (must be HTTPS, e.g., https://example.com/)"
-        required: true
-        default: "https://example.com/"
-      MANIFEST_URL:
-        description: "PWA manifest URL (optional; defaults to START_URL + manifest.json)"
-        required: false
-        default: ""
-      ICON_URL:
-        description: "Maskable 512x512 icon URL (optional; overrides PWA icon)"
-        required: false
-        default: ""
+workflow_dispatch:
+inputs:
+APP_NAME:
+description: "App Name"
+required: true
+default: "My Web2APK"
+APP_ID:
+description: "Package ID (e.g., com.example.app)"
+required: true
+default: "com.example.web2apk"
+WEB_URL:
+description: "Web App URL (https://...)"
+required: true
+default: "https://example.com"
+CALLBACK_URL:
+description: "Make.com callback webhook URL (optional)"
+required: false
+default: ""
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    env:
-      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+build:
+runs-on: ubuntu-latest
+env:
+KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+steps:  
+  - name: Checkout  
+    uses: actions/checkout@v4  
 
-      - name: Setup Node.js 20
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
+  - name: Setup Java 21  
+    uses: actions/setup-java@v4  
+    with:  
+      distribution: temurin  
+      java-version: "21"  
 
-      - name: Setup Java 17 (Temurin)
-        uses: actions/setup-java@v4
-        with:
-          distribution: "temurin"
-          java-version: "17"
+  - name: Setup Node 20  
+    uses: actions/setup-node@v4  
+    with:  
+      node-version: "20"  
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          accept-android-sdk-licenses: true
+  - name: Setup Android SDK  
+    uses: android-actions/setup-android@v3  
+    with:  
+      accept-android-sdk-licenses: true  
 
-      - name: Install Bubblewrap
-        run: npm i -g @bubblewrap/cli@^1
+  # --------- Project deps (unchanged build logic) ---------  
+  - name: Ensure Node project & Capacitor deps  
+    shell: bash  
+    run: |  
+      if [ ! -f package.json ]; then  
+        cat > package.json <<'JSON'  
+      {  
+        "name": "web2apk",  
+        "version": "1.0.0",  
+        "private": true  
+      }  
+      JSON  
+      fi  
+      npm i -g @capacitor/cli  
+      npm i @capacitor/core @capacitor/android --save-exact  
+      mkdir -p dist  
+      # Minimal placeholder; main content loads via server.url below  
+      echo '<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1"><title>Web2APK</title><iframe src="${{ github.event.inputs.WEB_URL }}" style="border:0;position:fixed;inset:0;width:100%;height:100%"></iframe>' > dist/index.html  
 
-      - name: Validate inputs (HTTPS, reachable, package id)
-        shell: bash
-        run: |
-          set -e
-          URL="${{ github.event.inputs.START_URL }}"
-          [[ "$URL" =~ ^https:// ]] || { echo "ERROR: START_URL must start with https://"; exit 1; }
-          # Basic reachability (10s timeout)
-          curl -I --max-time 10 -sS "$URL" | head -n1
-          # Package id pattern
-          [[ "${{ github.event.inputs.PACKAGE_ID }}" =~ ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$ ]] \
-            || { echo "ERROR: PACKAGE_ID invalid"; exit 1; }
+  - name: Generate/Update Capacitor config  
+    shell: bash  
+    run: |  
+      node - <<'NODE'  
+      const fs = require('fs');  
+      const appName = "${{ github.event.inputs.APP_NAME }}";  
+      const appId   = "${{ github.event.inputs.APP_ID }}";  
+      const webUrl  = "${{ github.event.inputs.WEB_URL }}";  
+      const cfg = {  
+        appId: appId,  
+        appName: appName,  
+        webDir: "dist",  
+        server: { url: webUrl, androidScheme: "https", cleartext: true },  
+        android: { allowMixedContent: true }  
+      };  
+      fs.writeFileSync('capacitor.config.json', JSON.stringify(cfg, null, 2));  
+      NODE  
 
-      - name: Derive host/paths and defaults
-        id: derive
-        shell: bash
-        run: |
-          set -e
-          node - <<'NODE'
-          const u = new URL(process.env.START_URL || "${{ github.event.inputs.START_URL }}");
-          const host = u.host;               // example.com
-          let startPath = u.pathname + u.search + u.hash;
-          if (!startPath || startPath === "/") startPath = "/";
-          // default manifest = <origin>/manifest.json
-          const manifestInput = process.env.MANIFEST_URL || "${{ github.event.inputs.MANIFEST_URL }}";
-          const manifestUrl = manifestInput && manifestInput.trim().length
-            ? manifestInput.trim()
-            : `${u.origin}/manifest.json`;
-          const out = { host, startPath, manifestUrl };
-          console.log(out);
-          const fs = require('fs');
-          fs.writeFileSync('derived.json', JSON.stringify(out, null, 2));
-          NODE
-          echo "derived=$(cat derived.json)" >> $GITHUB_OUTPUT
+  - name: Add Android & Sync  
+    shell: bash  
+    run: |  
+      npx cap add android || true  
+      npx cap sync android  
 
-      - name: Decode keystore
-        run: |
-          mkdir -p signing
-          echo "$KEYSTORE_BASE64" | base64 -d > signing/upload-key.jks
+  # --------- Signing (unchanged) ---------  
+  - name: Decode keystore from secret  
+    shell: bash  
+    run: |  
+      mkdir -p android  
+      echo "$KEYSTORE_BASE64" | base64 -d > android/my-release-key.jks  
 
-      - name: Compute SHA256 fingerprint (for assetlinks.json)
-        id: cert
-        shell: bash
-        run: |
-          set -e
-          FINGERPRINT=$(keytool -list -v \
-            -keystore signing/upload-key.jks \
-            -storepass "$KEYSTORE_PASSWORD" \
-            -alias "$KEY_ALIAS" -keypass "$KEY_PASSWORD" \
-            | grep -m1 "SHA256:" | sed 's/.*SHA256: //')
-          echo "sha256=$FINGERPRINT" >> $GITHUB_OUTPUT
-          echo "Upload key SHA256: $FINGERPRINT"
+  - name: Verify keystore (alias & passwords)  
+    shell: bash  
+    run: |  
+      keytool -list -v -keystore android/my-release-key.jks \  
+        -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" -keypass "$KEY_PASSWORD" >/dev/null  
 
-      - name: Prepare TWA manifest (non-interactive)
-        shell: bash
-        run: |
-          set -e
-          DERIVED=$(cat derived.json)
-          HOST=$(jq -r '.host' <<< "$DERIVED")
-          START_PATH=$(jq -r '.startPath' <<< "$DERIVED")
-          MANIFEST_URL=$(jq -r '.manifestUrl' <<< "$DERIVED")
+  # --------- Build (unchanged) ---------  
+  - name: Build (release, signed)  
+    working-directory: android  
+    shell: bash  
+    run: |  
+      chmod +x ./gradlew  
+      ./gradlew clean  
+      ./gradlew assembleRelease \  
+        -Pandroid.injected.signing.store.file=$PWD/my-release-key.jks \  
+        -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \  
+        -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \  
+        -Pandroid.injected.signing.key.password="$KEY_PASSWORD"  
+      ./gradlew bundleRelease \  
+        -Pandroid.injected.signing.store.file=$PWD/my-release-key.jks \  
+        -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \  
+        -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \  
+        -Pandroid.injected.signing.key.password="$KEY_PASSWORD"  
 
-          APP="${{ github.event.inputs.APP_NAME }}"
-          PKG="${{ github.event.inputs.PACKAGE_ID }}"
-          ICON_URL="${{ github.event.inputs.ICON_URL }}"
-          VC=$((10000 + $GITHUB_RUN_NUMBER))                      # Play needs monotonic int
-          VN="$(date +%Y.%m.%d).${GITHUB_RUN_NUMBER}"
+  # --------- Upload artifacts (SEPARATE) ---------  
+  - name: Upload APK (signed)  
+    uses: actions/upload-artifact@v4  
+    with:  
+      name: app-release-apk  
+      path: android/app/build/outputs/apk/release/*.apk  
+      if-no-files-found: error  
+      retention-days: 7  
 
-          mkdir -p twa
-          cat > twa/twa-manifest.json <<JSON
-          {
-            "packageId": "${PKG}",
-            "name": "${APP}",
-            "launcherName": "${APP}",
-            "host": "${HOST}",
-            "startUrl": "${START_PATH}",
-            "display": "standalone",
-            "themeColor": "#ffffff",
-            "navigationColor": "#000000",
-            "backgroundColor": "#ffffff",
-            "splashScreenFadeOutDuration": 300,
-            "webManifestUrl": "${MANIFEST_URL}",
-            "signingKey": { "path": "../signing/upload-key.jks", "alias": "${KEY_ALIAS}" },
-            "appVersionName": "${VN}",
-            "appVersionCode": ${VC}
-          }
-          JSON
+  - name: Upload AAB (signed)  
+    uses: actions/upload-artifact@v4  
+    with:  
+      name: app-release-aab  
+      path: android/app/build/outputs/bundle/release/*.aab  
+      if-no-files-found: error  
+      retention-days: 7  
 
-          if [ -n "$ICON_URL" ]; then
-            # add maskable icon override (Bubblewrap will pick it up)
-            jq --arg icon "$ICON_URL" '.maskableIconUrl = $icon | .iconUrl = $icon' \
-              twa/twa-manifest.json > twa/twa-manifest.tmp && mv twa/twa-manifest.tmp twa/twa-manifest.json
-          fi
+  # --------- Optional Make.com callback (unchanged logic) ---------  
+  - name: Callback to Make.com  
+    if: always()  
+    shell: bash  
+    run: |  
+      URL="${MAKE_WEBHOOK_URL}"  
+      if [ -z "$URL" ] && [ -n "${{ github.event.inputs.CALLBACK_URL }}" ]; then  
+        URL="${{ github.event.inputs.CALLBACK_URL }}"  
+      fi  
 
-          cat twa/twa-manifest.json
+      if [ -n "$URL" ]; then  
+        RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"  
+        STATUS="${{ job.status }}"  
+        APP_NAME='${{ github.event.inputs.APP_NAME }}'  
+        PKG_ID='${{ github.event.inputs.APP_ID }}'  
+        WEB_URL='${{ github.event.inputs.WEB_URL }}'  
+        # Artifact names (separate)  
+        APK_ARTIFACT="app-release-apk"  
+        AAB_ARTIFACT="app-release-aab"  
 
-      - name: Generate Android project
-        working-directory: twa
-        run: |
-          # Create android project from twa-manifest.json
-          bubblewrap update
+        PAYLOAD=$(printf '{"status":"%s","app_name":"%s","package_id":"%s","web_url":"%s","run_url":"%s","apk_artifact":"%s","aab_artifact":"%s"}' \  
+          "$STATUS" "$APP_NAME" "$PKG_ID" "$WEB_URL" "$RUN_URL" "$APK_ARTIFACT" "$AAB_ARTIFACT")  
 
-      - name: Pin target/compile SDK (stay Play-compliant)
-        working-directory: twa/android
-        shell: bash
-        run: |
-          # Make sure we target recent SDK (you can bump this as Play requirements change)
-          sed -i 's/compileSdkVersion [0-9]\+/compileSdkVersion 34/' app/build.gradle || true
-          sed -i 's/targetSdkVersion [0-9]\+/targetSdkVersion 34/' app/build.gradle || true
+        curl -sS -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$URL" || true  
+      else  
+        echo "No Make.com webhook URL provided. Skipping callback."  
+      
 
-      - name: Sign & build AAB + APK (release)
-        working-directory: twa/android
-        shell: bash
-        run: |
-          set -e
-          chmod +x ./gradlew
-          ./gradlew clean
-
-          # Ensure release signing uses our upload key
-          echo "RELEASE_STORE_FILE=$(pwd)/../signing/upload-key.jks" >> gradle.properties
-          echo "RELEASE_STORE_PASSWORD=${KEYSTORE_PASSWORD}" >> gradle.properties
-          echo "RELEASE_KEY_ALIAS=${KEY_ALIAS}" >> gradle.properties
-          echo "RELEASE_KEY_PASSWORD=${KEY_PASSWORD}" >> gradle.properties
-
-          # Inject signing into release if template doesn't have it
-          FILE=app/build.gradle
-          if ! grep -q "signingConfigs" "$FILE"; then
-            awk '1; /buildTypes \{/ && !x {print "        signingConfigs { release { storeFile file(RELEASE_STORE_FILE); storePassword RELEASE_STORE_PASSWORD; keyAlias RELEASE_KEY_ALIAS; keyPassword RELEASE_KEY_PASSWORD } }"; x=1}' $FILE > tmp && mv tmp $FILE
-          fi
-          if grep -q "release \{" "$FILE"; then
-            sed -i '0,/release \{/{s/release \{/release { signingConfig signingConfigs.release/}' "$FILE"
-          fi
-
-          ./gradlew bundleRelease      # Play-ready AAB
-          ./gradlew assembleRelease    # Release APK (signed)
-
-      - name: Build universal APK for testing (from AAB)
-        working-directory: twa/android
-        shell: bash
-        run: |
-          set -e
-          AAB=$(ls app/build/outputs/bundle/release/*.aab | head -n1)
-          cd ..
-          curl -sSL -o bundletool.jar https://github.com/google/bundletool/releases/download/1.15.6/bundletool-all-1.15.6.jar
-          java -jar bundletool.jar build-apks --bundle="$AAB" --output=app-release.apks \
-            --mode=universal --ks=signing/upload-key.jks --ks-pass=pass:"${KEYSTORE_PASSWORD}" \
-            --ks-key-alias="${KEY_ALIAS}" --key-pass=pass:"${KEY_PASSWORD}"
-          unzip -p app-release.apks universal.apk > android/app/build/outputs/apk/release/universal-release.apk
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-artifacts
-          path: |
-            twa/android/app/build/outputs/bundle/release/*.aab
-            twa/android/app/build/outputs/apk/release/*.apk
-          if-no-files-found: error
-          retention-days: 10
-
-      - name: Generate assetlinks.json (you must host it)
-        shell: bash
-        run: |
-          PKG="${{ github.event.inputs.PACKAGE_ID }}"
-          FPR="${{ steps.cert.outputs.sha256 }}"
-          cat > assetlinks.json <<JSON
-          [
-            {
-              "relation": ["delegate_permission/common.handle_all_urls"],
-              "target": {
-                "namespace": "android_app",
-                "package_name": "${PKG}",
-                "sha256_cert_fingerprints": ["${FPR}"]
-              }
-            }
-          ]
-          JSON
-          cat assetlinks.json
-
-      - name: Upload assetlinks.json
-        uses: actions/upload-artifact@v4
-        with:
-          name: assetlinks
-          path: assetlinks.json
-          retention-days: 10
-
-      - name: Summary (what to do next)
-        run: |
-          echo "✅ AAB & APK built. Download from the 'release-artifacts' artifact." >> $GITHUB_STEP_SUMMARY
-          echo "👉 Host assetlinks.json at: https://${{ fromJson(steps.derive.outputs.derived).host }}/.well-known/assetlinks.json" >> $GITHUB_STEP_SUMMARY
-          echo "   Then publish the AAB in Play Console with Play App Signing enabled." >> $GITHUB_STEP_SUMMARY
