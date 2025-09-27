@@ -167,4 +167,7 @@ steps:
         curl -sS -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$URL" || true  
       else  
         echo "No Make.com webhook URL provided. Skipping callback."  
-      
+      fi
+
+
+
