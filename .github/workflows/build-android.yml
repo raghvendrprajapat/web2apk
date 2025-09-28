@@ -1,5 +1,5 @@
 # Workflow ka Naam
-name: Build Android (Signed APK & AA B)
+name: Build Android (Signed APK & AAB)
 
 # Yeh workflow ko 'Actions' tab se manually run karne ki anumati deta hai
 on:
@@ -17,6 +17,19 @@ on:
         description: "Web App URL (https://...)"
         required: true
         default: "https://example.com"
+      # NEW: Yahan se aap plugin chun sakte hain
+      PLUGINS:
+        description: "Select which Capacitor plugins to install"
+        type: choice
+        required: true
+        default: 'none'
+        options:
+          - none
+          - camera
+          - push-notifications
+          - location
+          - camera_and_push
+          - all
       VERSION_NAME:
         description: "App Version Name (e.g., 1.0.1)"
         required: true
@@ -58,7 +71,7 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      # STEP MODIFIED: Is step mein plugins add kiye gaye hain
+      # STEP MODIFIED: Ab yeh aapke chunav ke aadhar par plugin install karega
       - name: Install Capacitor Dependencies and Plugins
         shell: bash
         run: |
@@ -75,12 +88,33 @@ jobs:
           npm i -g @capacitor/cli
           npm i @capacitor/core @capacitor/android --save-exact
           
-          # NEW: Camera aur Push Notification plugins ko yahan install karein
-          npm i @capacitor/camera @capacitor/push-notifications --save-exact
+          # NEW: User ke chunav ko check karke plugins install karega
+          PLUGINS_TO_INSTALL=""
+          CHOICE="${{ github.event.inputs.PLUGINS }}"
+
+          if [ "$CHOICE" = "camera" ]; then
+            PLUGINS_TO_INSTALL="@capacitor/camera"
+          elif [ "$CHOICE" = "push-notifications" ]; then
+            PLUGINS_TO_INSTALL="@capacitor/push-notifications"
+          elif [ "$CHOICE" = "location" ]; then
+            PLUGINS_TO_INSTALL="@capacitor/geolocation"
+          elif [ "$CHOICE" = "camera_and_push" ]; then
+            PLUGINS_TO_INSTALL="@capacitor/camera @capacitor/push-notifications"
+          elif [ "$CHOICE" = "all" ]; then
+            PLUGINS_TO_INSTALL="@capacitor/camera @capacitor/push-notifications @capacitor/geolocation"
+          fi
+
+          if [ -n "$PLUGINS_TO_INSTALL" ]; then
+            echo "Installing selected plugins: $PLUGINS_TO_INSTALL"
+            npm i $PLUGINS_TO_INSTALL --save-exact
+          else
+            echo "No extra plugins selected."
+          fi
           
           mkdir -p www
           echo '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"></head><body></body></html>' > www/index.html
 
+      # Baaki ke saare steps bilkul same hain...
       - name: Generate/Update Capacitor Config
         shell: bash
         run: |
@@ -88,7 +122,6 @@ jobs:
             "${{ github.event.inputs.APP_NAME }}" \
             "${{ github.event.inputs.APP_ID }}" \
             --web-dir "www"
-          
           npx cap config set server.url "${{ github.event.inputs.WEB_URL }}"
           npx cap config set server.androidScheme "https"
           npx cap config set android.allowMixedContent true
@@ -96,7 +129,6 @@ jobs:
       - name: Add Android Platform & Sync
         run: |
           npx cap add android
-          # Sync command ab camera aur push notification plugins ko Android project mein jod dega
           npx cap sync android
           
       - name: Set App Version in Gradle
@@ -108,7 +140,6 @@ jobs:
           sed -i "s/versionName \".*\"/versionName \"$VERSION_NAME\"/" $GRADLE_FILE
           sed -i "s/versionCode .*/versionCode $VERSION_CODE/" $GRADLE_FILE
 
-      # Baaki ke steps same rahenge...
       - name: Decode Keystore
         shell: bash
         run: |
