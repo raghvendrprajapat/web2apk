@@ -1,103 +1,185 @@
-# build-and-release.yml (Optimized and Secure)
-name: Build and Release Android AAB
+name: Build Android (Signed APK & AAB)
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
-  workflow_dispatch: # Allows manual triggering
-
-# Enforce the principle of least privilege by setting default permissions to none.
-permissions:
-  contents: read
+  workflow_dispatch:
+    inputs:
+      APP_NAME:
+        description: "App Name (e.g., My Awesome App)"
+        required: true
+        default: "My Web2APK"
+      APP_ID:
+        description: "Package ID (e.g., com.example.app)"
+        required: true
+        default: "com.example.web2apk"
+      WEB_URL:
+        description: "Web App URL (https://...)"
+        required: true
+        default: "https://example.com"
+      PLUGINS:
+        description: "Capacitor plugins to include"
+        type: choice
+        required: true
+        default: "none"
+        options:
+          - "none"
+          - "camera"
+          - "push-notifications"
+          - "location"
+          - "camera_and_push"
+          - "all"
+      VERSION_NAME:
+        description: "App Version Name (e.g., 1.0.1)"
+        required: true
+        default: "1.0.0"
+      VERSION_CODE:
+        description: "Unique Version Code (integer, e.g., 1)"
+        required: true
+        default: "1"
 
 jobs:
-  build_and_sign:
-    name: Build and Sign AAB
+  build:
     runs-on: ubuntu-latest
+    # Scope only non-sensitive env here; secrets are scoped per step where possible
+    env:
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
     steps:
-      # Step 1: Check out the repository code using a pinned commit SHA for security.
-      - name: Checkout repository
-        uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # Pinned to a specific commit
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-      # Step 2: Set up JDK 17, required for modern Android builds.
-      - name: Set up JDK 17
+      - name: Setup Java (JDK 21)
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: '21'
 
-      # Step 3: Set up Node.js for JavaScript-based tooling (e.g., Capacitor/React Native).
-      - name: Set up Node.js
+      - name: Setup Node.js (v20)
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      # Step 4: Cache Node.js dependencies for faster builds.
-      # The cache is invalidated only when package-lock.json changes.
-      - name: Cache Node.js modules
-        uses: actions/cache@v4
+      - name: Setup Android SDK (API 35 + Build-Tools 35)
+        uses: android-actions/setup-android@v3
         with:
-          path: ~/.npm
-          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-
+          packages: |
+            platform-tools
+            platforms;android-35
+            build-tools;35.0.0
 
-      # Step 5: Install dependencies using 'npm ci' for deterministic and fast installs.
-      - name: Install dependencies
-        run: npm ci
+      - name: Install Capacitor CLI and Core
+        run: |
+          if [ ! -f package.json ]; then
+            cat > package.json <<'JSON'
+            {
+              "name": "web2apk-app",
+              "version": "1.0.0",
+              "private": true
+            }
+            JSON
+          fi
+          npm install -g @capacitor/cli@latest
+          npm install @capacitor/core@latest @capacitor/android@latest --save-exact
 
-      # Step 6: Cache Gradle dependencies to significantly speed up build times.
-      # The cache key includes hashes of build files to ensure it's updated when dependencies change.
-      - name: Cache Gradle packages
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
+      - name: Install Selected Capacitor Plugins
+        run: |
+          CHOICE="${{ github.event.inputs.PLUGINS }}"
+          if [ "$CHOICE" = "camera" ]; then
+            PLUGINS_TO_INSTALL="@capacitor/camera"
+          elif [ "$CHOICE" = "push-notifications" ]; then
+            PLUGINS_TO_INSTALL="@capacitor/push-notifications"
+          elif [ "$CHOICE" = "location" ]; then
+            PLUGINS_TO_INSTALL="@capacitor/geolocation"
+          elif [ "$CHOICE" = "camera_and_push" ]; then
+            PLUGINS_TO_INSTALL="@capacitor/camera @capacitor/push-notifications"
+          elif [ "$CHOICE" = "all" ]; then
+            PLUGINS_TO_INSTALL="@capacitor/camera @capacitor/push-notifications @capacitor/geolocation"
+          else
+            PLUGINS_TO_INSTALL=""
+          fi
 
-      # Step 7: Decode the keystore from a Base64 secret into a file on the runner.
-      # This avoids storing the sensitive keystore file in the repository.
+          if [ -n "$PLUGINS_TO_INSTALL" ]; then
+            echo "Installing selected plugins: $PLUGINS_TO_INSTALL"
+            npm install $PLUGINS_TO_INSTALL --save-exact
+          else
+            echo "No extra plugins selected."
+          fi
+
+          mkdir -p www
+          echo '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"></head><body></body></html>' > www/index.html
+
+      - name: Init & Configure Capacitor
+        run: |
+          npx cap init "${{ github.event.inputs.APP_NAME }}" "${{ github.event.inputs.APP_ID }}" --web-dir "www"
+          npx cap config set server.url "${{ github.event.inputs.WEB_URL }}"
+          npx cap config set server.androidScheme "https"
+          # SECURITY: leave this false unless your site loads http assets
+          npx cap config set android.allowMixedContent false
+
+      - name: Add Android platform & Sync
+        run: |
+          npx cap add android
+          npx cap sync android
+
+      - name: Force SDK levels to API 35 (target/compile) and minSdk 22+
+        run: |
+          FILE_VARS="android/variables.gradle"
+          if [ -f "$FILE_VARS" ]; then
+            sed -i 's/compileSdkVersion *= *[0-9]\+/compileSdkVersion = 35/' $FILE_VARS
+            sed -i 's/targetSdkVersion *= *[0-9]\+/targetSdkVersion = 35/' $FILE_VARS
+            # Capacitor v4+ typically needs minSdk >= 22
+            sed -i 's/minSdkVersion *= *[0-9]\+/minSdkVersion = 22/' $FILE_VARS
+          else
+            sed -i 's/compileSdkVersion [0-9]\+/compileSdkVersion 35/' android/app/build.gradle || true
+            sed -i 's/targetSdkVersion [0-9]\+/targetSdkVersion 35/' android/app/build.gradle || true
+            sed -i 's/minSdkVersion [0-9]\+/minSdkVersion 22/' android/app/build.gradle || true
+          fi
+
+      - name: Set App Version in Gradle
+        run: |
+          VERSION_NAME="${{ github.event.inputs.VERSION_NAME }}"
+          VERSION_CODE="${{ github.event.inputs.VERSION_CODE }}"
+          GRADLE_FILE="android/app/build.gradle"
+          sed -i "s/versionName \".*\"/versionName \"$VERSION_NAME\"/" $GRADLE_FILE
+          sed -i "s/versionCode .*/versionCode $VERSION_CODE/" $GRADLE_FILE
+
       - name: Decode Keystore
         env:
-          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
-          echo "Decoding keystore..."
-          echo $RELEASE_KEYSTORE_BASE64 | base64 --decode >./android/app/release.keystore
-          echo "Keystore decoded successfully."
+          echo "Decoding Android keystore…"
+          base64 -d <<<"$KEYSTORE_BASE64" > android/release-key.jks
 
-      # Step 8: Make the Gradle wrapper executable.
-      - name: Make gradlew executable
-        run: chmod +x./android/gradlew
-
-      # Step 9: Build and sign the AAB using Gradle.
-      # Secrets are passed as environment variables, which is more secure than command-line arguments.
-      # Gradle reads these variables to configure the signing process.
-      - name: Build and Sign Release AAB
-        working-directory:./android
+      - name: Build Signed AAB and APK
+        working-directory: android
         env:
-          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
-          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
-          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
-        run:./gradlew bundleRelease
+          STORE_FILE: $PWD/release-key.jks
+        run: |
+          chmod +x ./gradlew
+          ./gradlew bundleRelease \
+            -Pandroid.injected.signing.store.file="$STORE_FILE" \
+            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PASSWORD"
+          ./gradlew assembleRelease \
+            -Pandroid.injected.signing.store.file="$STORE_FILE" \
+            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PASSWORD"
 
-      # Step 10: Clean up the decoded keystore file immediately after use.
-      - name: Clean up Keystore
-        if: always() # This step runs even if the build fails, ensuring cleanup.
-        run: rm -f./android/app/release.keystore
-
-      # Step 11: Upload the signed AAB as a build artifact.
-      # This allows it to be downloaded for manual testing or deployment.
-      - name: Upload Signed AAB
+      - name: Upload AAB (Play Store ready)
         uses: actions/upload-artifact@v4
         with:
-          name: signed-release-aab
-          path:./android/app/build/outputs/bundle/release/app-release.aab
-          
+          name: app-release-aab
+          path: android/app/build/outputs/bundle/release/*.aab
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload APK (for testing)
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 7
