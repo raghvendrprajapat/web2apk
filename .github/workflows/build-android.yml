@@ -56,7 +56,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      # perf tuning
       GRADLE_OPTS: "-Dorg.gradle.jvmargs='-Xmx3g -XX:+UseParallelGC' -Dorg.gradle.daemon=false"
       TARGET_SDK: ${{ github.event.inputs.TARGET_SDK }}
       MIN_SDK: ${{ github.event.inputs.MIN_SDK }}
@@ -73,7 +72,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---- CACHES ----
+      # ---------- CACHES ----------
       - name: Cache NPM
         uses: actions/cache@v4
         with:
@@ -92,27 +91,29 @@ jobs:
           restore-keys: |
             gradle-${{ runner.os }}-
 
-      # ---- VALIDATIONS ----
+      # ---------- VALIDATIONS ----------
       - name: Validate Inputs & Secrets
         id: validate
         shell: bash
         run: |
           set -euo pipefail
           echo "## Pre-Build Validation" >> "$GITHUB_STEP_SUMMARY"
+
           if [[ ! "$APP_ID" =~ ^[a-z]+([a-z0-9_]*)(\.[a-z][a-z0-9_]*)+$ ]]; then
             echo "Invalid APP_ID: $APP_ID" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
           if ! [[ "$VERSION_CODE" =~ ^[0-9]+$ ]]; then
             echo "VERSION_CODE must be integer" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
           if [[ "$ALLOW_MIXED_CONTENT" != "true" && ! "$WEB_URL" =~ ^https:// ]]; then
-            echo "WEB_URL must be https:// (or set ALLOW_MIXED_CONTENT=true)" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
+            echo "WEB_URL must start with https:// (or set ALLOW_MIXED_CONTENT=true)" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
           if [[ "$TARGET_SDK" -lt 35 ]]; then
-            echo "TARGET_SDK must be 35 (Play 2025)" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
+            echo "TARGET_SDK must be 35 (Play 2025)"; exit 1; fi
           if [[ "$MIN_SDK" -lt 22 ]]; then
-            echo "MIN_SDK should be >= 22" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
+            echo "MIN_SDK should be >= 22"; exit 1; fi
+
           for s in KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
             [[ -z "${!s:-}" ]] && echo "Missing secret: $s" | tee -a "$GITHUB_STEP_SUMMARY" && M=1 || true
-          done; [[ "${M:-0}" -eq 1 ]] && exit 1 || true
-          echo "Inputs & secrets OK" >> "$GITHUB_STEP_SUMMARY"
+          done
+          [[ "${M:-0}" -eq 1 ]] && exit 1 || echo "Inputs & secrets OK" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Setup Java (JDK 21)
         uses: actions/setup-java@v4
@@ -125,15 +126,25 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Setup Android SDK (API & Build-Tools)
+      # ---------- ANDROID SDK (ROBUST) ----------
+      - name: Install Android commandline + platform-tools
         uses: android-actions/setup-android@v3
         with:
           packages: |
+            cmdline-tools;latest
             platform-tools
-            platforms;android-${{ github.event.inputs.TARGET_SDK }}
-            build-tools;${{ github.event.inputs.TARGET_SDK }}.0.0
 
-      # ---- INSTALL ----
+      - name: Install Android platform & build-tools (robust with fallbacks)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Installing platforms;android-${TARGET_SDK} (fallback to 34 if needed)"
+          sdkmanager --install "platforms;android-${TARGET_SDK}" || sdkmanager --install "platforms;android-34"
+          echo "Installing build-tools (tries 35.0.1 → 35.0.0 → 34.0.0)"
+          sdkmanager --install "build-tools;35.0.1" || sdkmanager --install "build-tools;35.0.0" || sdkmanager --install "build-tools;34.0.0"
+          yes | sdkmanager --licenses >/dev/null
+
+      # ---------- INSTALL ----------
       - name: Install Capacitor CLI & Core (npm ci)
         shell: bash
         run: |
@@ -143,7 +154,7 @@ jobs:
             { "name": "web2apk-app", "version": "1.0.0", "private": true }
             JSON
           fi
-          npm ci || npm i
+          if [ -f package-lock.json ]; then npm ci; else npm i; fi
           npm i -g @capacitor/cli@latest
           npm i @capacitor/core@latest @capacitor/android@latest --save-exact
 
@@ -153,7 +164,7 @@ jobs:
           CHOICE="${{ github.event.inputs.PLUGINS }}"
           if [ "$CHOICE" = "camera" ]; then
             PLUGINS_TO_INSTALL="@capacitor/camera"
-          elif [ "$CHOICE" = "push-notifications" ]; then
+          elif [ "$CHOOICE" = "push-notifications" ]; then
             PLUGINS_TO_INSTALL="@capacitor/push-notifications"
           elif [ "$CHOICE" = "location" ]; then
             PLUGINS_TO_INSTALL="@capacitor/geolocation"
@@ -164,11 +175,17 @@ jobs:
           else
             PLUGINS_TO_INSTALL=""
           fi
-          [ -n "$PLUGINS_TO_INSTALL" ] && npm i $PLUGINS_TO_INSTALL --save-exact || echo "No extra plugins"
+
+          if [ -n "$PLUGINS_TO_INSTALL" ]; then
+            npm i $PLUGINS_TO_INSTALL --save-exact
+          else
+            echo "No extra plugins selected."
+          fi
+
           mkdir -p www
           echo '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"></head><body></body></html>' > www/index.html
 
-      # ---- CAPACITOR INIT ----
+      # ---------- CAPACITOR INIT ----------
       - name: Init & Configure Capacitor
         shell: bash
         run: |
@@ -183,7 +200,7 @@ jobs:
           npx cap add android
           npx cap sync android
 
-      # ---- ENFORCE SDK LEVELS ----
+      # ---------- ENFORCE SDK LEVELS ----------
       - name: Force SDK levels (target/compile/min)
         shell: bash
         run: |
@@ -206,7 +223,7 @@ jobs:
           sed -i "s/versionName \".*\"/versionName \"$VERSION_NAME\"/" $GRADLE_FILE
           sed -i "s/versionCode .*/versionCode $VERSION_CODE/" $GRADLE_FILE
 
-      # ---- KEYSTORE ----
+      # ---------- KEYSTORE ----------
       - name: Decode Keystore (scoped secret)
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
@@ -214,9 +231,9 @@ jobs:
         run: |
           set -euo pipefail
           base64 -d <<<"$KEYSTORE_BASE64" > android/release-key.jks
-          keytool -list -v -keystore android/release-key.jks -storepass "$KEYSTORE_PASSWORD" >/dev/null 2>&1 || { echo "Keystore verify failed"; exit 1; }
+          keytool -list -v -keystore android/release-key.jks -storepass "$KEYSTORE_PASSWORD" >/dev/null 2>&1 || { echo "Keystore verification failed"; exit 1; }
 
-      # ---- BUILD ----
+      # ---------- BUILD ----------
       - name: Build Signed AAB and APK
         working-directory: android
         shell: bash
@@ -225,6 +242,7 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x ./gradlew
+          ./gradlew --no-daemon clean
           ./gradlew --no-daemon bundleRelease \
             -Pandroid.injected.signing.store.file="$STORE_FILE" \
             -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
@@ -243,9 +261,11 @@ jobs:
           [ -z "$AAB" ] && echo "No AAB found" && exit 1
           SIZE_BYTES=$(stat -c%s "$AAB")
           LIMIT=$((4*1024*1024*1024))
-          [ "$SIZE_BYTES" -lt "$LIMIT" ] || { echo "AAB >=4GB"; exit 1; }
+          if [ "$SIZE_BYTES" -ge "$LIMIT" ]; then
+            echo "AAB is >= 4GB limit ($SIZE_BYTES bytes)"; exit 1
+          fi
 
-      # ---- ARTIFACTS ----
+      # ---------- ARTIFACTS ----------
       - name: Upload AAB (Play Store ready)
         uses: actions/upload-artifact@v4
         with:
@@ -262,18 +282,35 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      # ---- OPTIONAL WEBHOOK ----
+      # ---------- OPTIONAL WEBHOOK ----------
       - name: Notify Make.com Webhook (optional)
-        if: ${{ secrets.MAKE_WEBHOOK_URL != '' }}
         shell: bash
+        env:
+          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
+          APP_ID: ${{ env.APP_ID }}
+          VERSION_NAME: ${{ env.VERSION_NAME }}
+          VERSION_CODE: ${{ env.VERSION_CODE }}
         run: |
-          URL="${{ secrets.MAKE_WEBHOOK_URL }}"
-          PAYLOAD=$(jq -n --arg appId "$APP_ID" --arg vN "$VERSION_NAME" --arg vC "$VERSION_CODE" '{appId:$appId, versionName:$vN, versionCode:$vC, status:"success"}')
+          set -euo pipefail
+          if [ -z "${MAKE_WEBHOOK_URL:-}" ]; then
+            echo "Skipping webhook: MAKE_WEBHOOK_URL not set."
+            exit 0
+          fi
+          if command -v jq >/dev/null 2>&1; then
+            PAYLOAD=$(jq -n --arg appId "$APP_ID" --arg vN "$VERSION_NAME" --arg vC "$VERSION_CODE" '{appId:$appId, versionName:$vN, versionCode:$vC, status:"success"}')
+          else
+            PAYLOAD="{\"appId\":\"$APP_ID\",\"versionName\":\"$VERSION_NAME\",\"versionCode\":\"$VERSION_CODE\",\"status\":\"success\"}"
+          fi
           for i in {1..3}; do
-            code=$(curl -sS -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$URL" || true)
-            [[ "$code" == "200" || "$code" == "202" ]] && exit 0 || sleep 3
+            code=$(curl -sS -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$MAKE_WEBHOOK_URL" || true)
+            if [ "$code" = "200" ] || [ "$code" = "202" ]; then
+              echo "Webhook delivered (attempt $i)"
+              exit 0
+            fi
+            echo "Webhook attempt $i failed (HTTP $code). Retrying..."
+            sleep 3
           done
-          echo "Webhook failed (non-blocking)"
+          echo "Webhook failed after retries (non-blocking)"
 
       - name: Secure Cleanup
         if: always()
