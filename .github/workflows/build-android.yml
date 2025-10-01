@@ -105,9 +105,9 @@ jobs:
           if [[ "$ALLOW_MIXED_CONTENT" != "true" && ! "$WEB_URL" =~ ^https:// ]]; then
             echo "WEB_URL must start with https:// (or set ALLOW_MIXED_CONTENT=true)" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
           if [[ "$TARGET_SDK" -lt 35 ]]; then
-            echo "TARGET_SDK must be 35 (Play 2025)" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
+            echo "TARGET_SDK must be 35 (Play 2025)"; exit 1; fi
           if [[ "$MIN_SDK" -lt 22 ]]; then
-            echo "MIN_SDK should be >= 22" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
+            echo "MIN_SDK should be >= 22"; exit 1; fi
 
           for s in KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
             [[ -z "${!s:-}" ]] && echo "Missing secret: $s" | tee -a "$GITHUB_STEP_SUMMARY" && M=1 || true
@@ -125,7 +125,7 @@ jobs:
         with:
           node-version: '20'
 
-      # ---------- ANDROID SDK (MANUAL, SUPER-ROBUST) ----------
+      # ---------- ANDROID SDK (MANUAL & CORRECT PATH USAGE) ----------
       - name: Install Android SDK (API 35 + Build-Tools) - Manual
         shell: bash
         run: |
@@ -133,43 +133,53 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y wget unzip
 
-          # Try multiple known revisions of commandlinetools; first that works wins
-          mkdir -p "$HOME/android-sdk"
-          cd "$HOME/android-sdk"
+          SDK_ROOT="$HOME/android-sdk"
+          mkdir -p "$SDK_ROOT"
+          cd "$SDK_ROOT"
+
+          # Try multiple known revisions; first successful download wins
           for REV in 11076708 10406996 9477386; do
             URL="https://dl.google.com/android/repository/commandlinetools-linux-${REV}_latest.zip"
             echo "Downloading cmdline-tools rev ${REV}..."
-            if curl -fL "$URL" -o cmdtools.zip; then
+            if curl -fsSL "$URL" -o cmdtools.zip; then
               break
             fi
           done
           [ -f cmdtools.zip ] || { echo "Failed to download Android cmdline-tools"; exit 1; }
 
-          mkdir -p "$HOME/android-sdk/cmdline-tools"
-          unzip -q cmdtools.zip -d "$HOME/android-sdk/cmdline-tools"
-          # some zips extract to 'cmdline-tools', some to folder 'tools'; normalize to 'latest'
-          if [ -d "$HOME/android-sdk/cmdline-tools/cmdline-tools" ]; then
-            mv "$HOME/android-sdk/cmdline-tools/cmdline-tools" "$HOME/android-sdk/cmdline-tools/latest"
-          elif [ -d "$HOME/android-sdk/cmdline-tools/tools" ]; then
-            mv "$HOME/android-sdk/cmdline-tools/tools" "$HOME/android-sdk/cmdline-tools/latest"
+          mkdir -p "$SDK_ROOT/cmdline-tools"
+          unzip -q cmdtools.zip -d "$SDK_ROOT/cmdline-tools"
+
+          # Normalize folder name to 'latest'
+          if [ -d "$SDK_ROOT/cmdline-tools/cmdline-tools" ]; then
+            mv "$SDK_ROOT/cmdline-tools/cmdline-tools" "$SDK_ROOT/cmdline-tools/latest"
+          elif [ -d "$SDK_ROOT/cmdline-tools/tools" ]; then
+            mv "$SDK_ROOT/cmdline-tools/tools" "$SDK_ROOT/cmdline-tools/latest"
           fi
 
-          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> "$GITHUB_ENV"
-          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-          echo "$HOME/android-sdk/platform-tools" >> "$GITHUB_PATH"
+          # Use absolute path for THIS step (GITHUB_PATH applies only to next steps)
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
+          export PATH="$SDK_ROOT/platform-tools:$SDK_ROOT/cmdline-tools/latest/bin:$PATH"
 
-          yes | sdkmanager --licenses >/dev/null
-          sdkmanager "platform-tools" || true
+          "$SDKMANAGER" --version || true
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install "platform-tools" || true
 
-          # Platform install (35 -> fallback 34)
-          sdkmanager "platforms;android-${TARGET_SDK}" || sdkmanager "platforms;android-34"
+          # Install platform with fallback (35 -> 34)
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install "platforms;android-${TARGET_SDK}" \
+            || "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install "platforms;android-34"
 
-          # Build-tools install with fallbacks
-          BT_INSTALLED=0
+          # Build-tools with fallbacks
+          FOUND=0
           for BT in "build-tools;35.0.2" "build-tools;35.0.1" "build-tools;35.0.0" "build-tools;34.0.0"; do
-            if sdkmanager "$BT"; then echo "Installed $BT"; BT_INSTALLED=1; break; fi
+            if "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install "$BT"; then
+              echo "Installed $BT"; FOUND=1; break
+            else
+              echo "Could not install $BT, trying next…"
+            fi
           done
-          [ "$BT_INSTALLED" -eq 1 ] || { echo "No suitable build-tools installed"; exit 1; }
+          [[ "$FOUND" -eq 1 ]] || { echo "No suitable build-tools installed"; exit 1; }
 
       # ---------- INSTALL ----------
       - name: Install Capacitor CLI & Core (npm ci)
@@ -202,13 +212,11 @@ jobs:
           else
             PLUGINS_TO_INSTALL=""
           fi
-
           if [ -n "$PLUGINS_TO_INSTALL" ]; then
             npm i $PLUGINS_TO_INSTALL --save-exact
           else
             echo "No extra plugins selected."
           fi
-
           mkdir -p www
           echo '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"></head><body></body></html>' > www/index.html
 
