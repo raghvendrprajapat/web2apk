@@ -106,9 +106,9 @@ jobs:
           if [[ "$ALLOW_MIXED_CONTENT" != "true" && ! "$WEB_URL" =~ ^https:// ]]; then
             echo "WEB_URL must start with https:// (or set ALLOW_MIXED_CONTENT=true)" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
           if [[ "$TARGET_SDK" -lt 35 ]]; then
-            echo "TARGET_SDK must be 35 (Play 2025)"; exit 1; fi
+            echo "TARGET_SDK must be 35 (Play 2025)" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
           if [[ "$MIN_SDK" -lt 22 ]]; then
-            echo "MIN_SDK should be >= 22"; exit 1; fi
+            echo "MIN_SDK should be >= 22" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
 
           for s in KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
             [[ -z "${!s:-}" ]] && echo "Missing secret: $s" | tee -a "$GITHUB_STEP_SUMMARY" && M=1 || true
@@ -126,23 +126,35 @@ jobs:
         with:
           node-version: '20'
 
-      # ---------- ANDROID SDK (ROBUST) ----------
-      - name: Install Android commandline + platform-tools
+      # ---------- ANDROID SDK (SAFE BRING-UP) ----------
+      - name: Setup Android SDK (base)
         uses: android-actions/setup-android@v3
-        with:
-          packages: |
-            cmdline-tools;latest
-            platform-tools
+        # no 'packages' here; just install cmdline tools & set ANDROID_SDK_ROOT
 
-      - name: Install Android platform & build-tools (robust with fallbacks)
+      - name: Install Android platform & build-tools (robust)
         shell: bash
         run: |
           set -euo pipefail
-          echo "Installing platforms;android-${TARGET_SDK} (fallback to 34 if needed)"
-          sdkmanager --install "platforms;android-${TARGET_SDK}" || sdkmanager --install "platforms;android-34"
-          echo "Installing build-tools (tries 35.0.1 → 35.0.0 → 34.0.0)"
-          sdkmanager --install "build-tools;35.0.1" || sdkmanager --install "build-tools;35.0.0" || sdkmanager --install "build-tools;34.0.0"
-          yes | sdkmanager --licenses >/dev/null
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          echo "sdkmanager: $SDKMANAGER"
+          # Accept licenses first
+          yes | "$SDKMANAGER" --licenses >/dev/null
+          # Always ensure platform-tools
+          "$SDKMANAGER" --install "platform-tools" || true
+
+          # Install platform with fallback (35 -> 34)
+          "$SDKMANAGER" --install "platforms;android-${TARGET_SDK}" \
+          || "$SDKMANAGER" --install "platforms;android-34"
+
+          # Build-tools with multiple fallbacks (newest first)
+          for BT in "build-tools;35.0.2" "build-tools;35.0.1" "build-tools;35.0.0" "build-tools;34.0.0"; do
+            if "$SDKMANAGER" --install "$BT"; then
+              echo "Installed $BT"; FOUND=1; break
+            else
+              echo "Could not install $BT, trying next…"
+            fi
+          done
+          [[ "${FOUND:-0}" -eq 1 ]] || { echo "No suitable build-tools installed"; exit 1; }
 
       # ---------- INSTALL ----------
       - name: Install Capacitor CLI & Core (npm ci)
@@ -164,7 +176,7 @@ jobs:
           CHOICE="${{ github.event.inputs.PLUGINS }}"
           if [ "$CHOICE" = "camera" ]; then
             PLUGINS_TO_INSTALL="@capacitor/camera"
-          elif [ "$CHOOICE" = "push-notifications" ]; then
+          elif [ "$CHOICE" = "push-notifications" ]; then
             PLUGINS_TO_INSTALL="@capacitor/push-notifications"
           elif [ "$CHOICE" = "location" ]; then
             PLUGINS_TO_INSTALL="@capacitor/geolocation"
@@ -175,13 +187,11 @@ jobs:
           else
             PLUGINS_TO_INSTALL=""
           fi
-
           if [ -n "$PLUGINS_TO_INSTALL" ]; then
             npm i $PLUGINS_TO_INSTALL --save-exact
           else
             echo "No extra plugins selected."
           fi
-
           mkdir -p www
           echo '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"></head><body></body></html>' > www/index.html
 
@@ -207,9 +217,9 @@ jobs:
           set -euo pipefail
           FILE_VARS="android/variables.gradle"
           if [ -f "$FILE_VARS" ]; then
-            sed -i "s/compileSdkVersion *= *[0-9]\+/compileSdkVersion = $TARGET_SDK/" $FILE_VARS
-            sed -i "s/targetSdkVersion *= *[0-9]\+/targetSdkVersion = $TARGET_SDK/" $FILE_VARS
-            sed -i "s/minSdkVersion *= *[0-9]\+/minSdkVersion = $MIN_SDK/" $FILE_VARS
+            sed -i "s/compileSdkVersion *= *[0-9]\+/compileSdkVersion = $TARGET_SDK/" "$FILE_VARS"
+            sed -i "s/targetSdkVersion *= *[0-9]\+/targetSdkVersion = $TARGET_SDK/" "$FILE_VARS"
+            sed -i "s/minSdkVersion *= *[0-9]\+/minSdkVersion = $MIN_SDK/" "$FILE_VARS"
           else
             sed -i "s/compileSdkVersion [0-9]\+/compileSdkVersion $TARGET_SDK/" android/app/build.gradle || true
             sed -i "s/targetSdkVersion [0-9]\+/targetSdkVersion $TARGET_SDK/" android/app/build.gradle || true
@@ -220,8 +230,8 @@ jobs:
         shell: bash
         run: |
           GRADLE_FILE="android/app/build.gradle"
-          sed -i "s/versionName \".*\"/versionName \"$VERSION_NAME\"/" $GRADLE_FILE
-          sed -i "s/versionCode .*/versionCode $VERSION_CODE/" $GRADLE_FILE
+          sed -i "s/versionName \".*\"/versionName \"$VERSION_NAME\"/" "$GRADLE_FILE"
+          sed -i "s/versionCode .*/versionCode $VERSION_CODE/" "$GRADLE_FILE"
 
       # ---------- KEYSTORE ----------
       - name: Decode Keystore (scoped secret)
