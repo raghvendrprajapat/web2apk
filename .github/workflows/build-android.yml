@@ -1,9 +1,7 @@
 name: Build Android (Signed APK & AAB)
 
-# Yah workflow ko 'Actions' tab se manually (haath se) chalaane ki anumati deta hai
 on:
   workflow_dispatch:
-    # Ye inputs "Run workflow" button par click karne par ek form banate hain
     inputs:
       APP_NAME:
         description: "App Name (e.g., My Awesome App)"
@@ -18,15 +16,17 @@ on:
         required: true
         default: "https://example.com"
       PLUGINS:
-        description: "Select which Capacitor plugins to install"
+        description: "Capacitor plugins to include"
         type: choice
         required: true
-        default: 'none'
+        default: "none"
         options:
-          - none
-          - camera
-          - push-notifications
-          - all
+          - "none"
+          - "camera"
+          - "push-notifications"
+          - "location"
+          - "camera_and_push"
+          - "all"
       VERSION_NAME:
         description: "App Version Name (e.g., 1.0.1)"
         required: true
@@ -35,142 +35,315 @@ on:
         description: "Unique Version Code (integer, e.g., 1)"
         required: true
         default: "1"
-      ALLOW_HTTP:
-        description: "Allow http (non-https) content? (For development ONLY)"
-        type: boolean
+      ALLOW_MIXED_CONTENT:
+        description: "Allow http (non-HTTPS) content? (true/false)"
         required: true
-        default: false
+        default: "false"
       TARGET_SDK:
-        description: "Target SDK (Play Store rule: 34+)"
+        description: "Target/Compile SDK (Play 2025 rule: 35)"
         required: true
-        default: "34"
-      COMPILE_SDK:
-        description: "Compile SDK (Typically same as Target)"
+        default: "35"
+      MIN_SDK:
+        description: "Min SDK (Capacitor typical >=22)"
         required: true
-        default: "34"
+        default: "22"
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GRADLE_OPTS: "-Dorg.gradle.jvmargs='-Xmx3g -XX:+UseParallelGC' -Dorg.gradle.daemon=false"
+      TARGET_SDK: ${{ github.event.inputs.TARGET_SDK }}
+      MIN_SDK: ${{ github.event.inputs.MIN_SDK }}
+      APP_ID: ${{ github.event.inputs.APP_ID }}
+      VERSION_NAME: ${{ github.event.inputs.VERSION_NAME }}
+      VERSION_CODE: ${{ github.event.inputs.VERSION_CODE }}
+      WEB_URL: ${{ github.event.inputs.WEB_URL }}
+      ALLOW_MIXED_CONTENT: ${{ github.event.inputs.ALLOW_MIXED_CONTENT }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Java (JDK 17)
-        uses: actions/setup-java@v4
+      # ---------- CACHES ----------
+      - name: Cache NPM
+        uses: actions/cache@v4
         with:
-          distribution: 'temurin'
-          java-version: '17'
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/package.json') }}
+          restore-keys: |
+            npm-${{ runner.os }}-
 
-      - name: Setup Node.js (v20)
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm' # npm dependencies ke liye caching saksham karein
-
-      - name: Install Dependencies with npm ci
-        run: npm ci # 'npm install' se tez aur vishvasaneey
-
-      - name: Setup Gradle Cache
+      - name: Cache Gradle
         uses: actions/cache@v4
         with:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
           restore-keys: |
-            ${{ runner.os }}-gradle-
+            gradle-${{ runner.os }}-
 
-      - name: Install Capacitor Core Dependencies
-        run: npm i @capacitor/core @capacitor/android --save-exact
+      # ---------- VALIDATIONS ----------
+      - name: Validate Inputs & Secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "## Pre-Build Validation" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ ! "$APP_ID" =~ ^[a-z]+([a-z0-9_]*)(\.[a-z][a-z0-9_]*)+$ ]]; then
+            echo "Invalid APP_ID: $APP_ID" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
+          if ! [[ "$VERSION_CODE" =~ ^[0-9]+$ ]]; then
+            echo "VERSION_CODE must be integer" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
+          if [[ "$ALLOW_MIXED_CONTENT" != "true" && ! "$WEB_URL" =~ ^https:// ]]; then
+            echo "WEB_URL must start with https:// (or set ALLOW_MIXED_CONTENT=true)" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
+          if [[ "$TARGET_SDK" -lt 35 ]]; then
+            echo "TARGET_SDK must be 35 (Play 2025)"; exit 1; fi
+          if [[ "$MIN_SDK" -lt 22 ]]; then
+            echo "MIN_SDK should be >= 22"; exit 1; fi
+
+          for s in KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            [[ -z "${!s:-}" ]] && echo "Missing secret: $s" | tee -a "$GITHUB_STEP_SUMMARY" && M=1 || true
+          done
+          [[ "${M:-0}" -eq 1 ]] && exit 1 || echo "Inputs & secrets OK" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Setup Java (JDK 21)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Node.js (v20)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # ---------- ANDROID SDK (MANUAL & CORRECT PATH USAGE) ----------
+      - name: Install Android SDK (API 35 + Build-Tools) - Manual
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y wget unzip
+
+          SDK_ROOT="$HOME/android-sdk"
+          mkdir -p "$SDK_ROOT"
+          cd "$SDK_ROOT"
+
+          # Try multiple known revisions; first successful download wins
+          for REV in 11076708 10406996 9477386; do
+            URL="https://dl.google.com/android/repository/commandlinetools-linux-${REV}_latest.zip"
+            echo "Downloading cmdline-tools rev ${REV}..."
+            if curl -fsSL "$URL" -o cmdtools.zip; then
+              break
+            fi
+          done
+          [ -f cmdtools.zip ] || { echo "Failed to download Android cmdline-tools"; exit 1; }
+
+          mkdir -p "$SDK_ROOT/cmdline-tools"
+          unzip -q cmdtools.zip -d "$SDK_ROOT/cmdline-tools"
+
+          # Normalize folder name to 'latest'
+          if [ -d "$SDK_ROOT/cmdline-tools/cmdline-tools" ]; then
+            mv "$SDK_ROOT/cmdline-tools/cmdline-tools" "$SDK_ROOT/cmdline-tools/latest"
+          elif [ -d "$SDK_ROOT/cmdline-tools/tools" ]; then
+            mv "$SDK_ROOT/cmdline-tools/tools" "$SDK_ROOT/cmdline-tools/latest"
+          fi
+
+          # Use absolute path for THIS step (GITHUB_PATH applies only to next steps)
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
+          export PATH="$SDK_ROOT/platform-tools:$SDK_ROOT/cmdline-tools/latest/bin:$PATH"
+
+          "$SDKMANAGER" --version || true
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install "platform-tools" || true
+
+          # Install platform with fallback (35 -> 34)
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install "platforms;android-${TARGET_SDK}" \
+            || "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install "platforms;android-34"
+
+          # Build-tools with fallbacks
+          FOUND=0
+          for BT in "build-tools;35.0.2" "build-tools;35.0.1" "build-tools;35.0.0" "build-tools;34.0.0"; do
+            if "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install "$BT"; then
+              echo "Installed $BT"; FOUND=1; break
+            else
+              echo "Could not install $BT, trying next…"
+            fi
+          done
+          [[ "$FOUND" -eq 1 ]] || { echo "No suitable build-tools installed"; exit 1; }
+
+      # ---------- INSTALL ----------
+      - name: Install Capacitor CLI & Core (npm ci)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f package.json ]; then
+            cat > package.json <<'JSON'
+            { "name": "web2apk-app", "version": "1.0.0", "private": true }
+            JSON
+          fi
+          if [ -f package-lock.json ]; then npm ci; else npm i; fi
+          npm i -g @capacitor/cli@latest
+          npm i @capacitor/core@latest @capacitor/android@latest --save-exact
 
       - name: Install Selected Capacitor Plugins
+        shell: bash
         run: |
-          PLUGINS_TO_INSTALL=""
           CHOICE="${{ github.event.inputs.PLUGINS }}"
           if [ "$CHOICE" = "camera" ]; then
             PLUGINS_TO_INSTALL="@capacitor/camera"
           elif [ "$CHOICE" = "push-notifications" ]; then
             PLUGINS_TO_INSTALL="@capacitor/push-notifications"
-          elif [ "$CHOICE" = "all" ]; then
+          elif [ "$CHOICE" = "location" ]; then
+            PLUGINS_TO_INSTALL="@capacitor/geolocation"
+          elif [ "$CHOICE" = "camera_and_push" ]; then
             PLUGINS_TO_INSTALL="@capacitor/camera @capacitor/push-notifications"
+          elif [ "$CHOICE" = "all" ]; then
+            PLUGINS_TO_INSTALL="@capacitor/camera @capacitor/push-notifications @capacitor/geolocation"
+          else
+            PLUGINS_TO_INSTALL=""
           fi
-
-          if; then
-            echo "Installing selected plugins: $PLUGINS_TO_INSTALL"
+          if [ -n "$PLUGINS_TO_INSTALL" ]; then
             npm i $PLUGINS_TO_INSTALL --save-exact
           else
             echo "No extra plugins selected."
           fi
-
-      - name: Generate Capacitor Config
-        run: |
-          # capacitor.config.json file ko inputs se dynamically banata hai
-          echo '{' > capacitor.config.json
-          echo '  "appId": "${{ github.event.inputs.APP_ID }}",' >> capacitor.config.json
-          echo '  "appName": "${{ github.event.inputs.APP_NAME }}",' >> capacitor.config.json
-          echo '  "webDir": "www",' >> capacitor.config.json
-          if; then
-            echo '  "server": { "androidScheme": "http", "cleartext": true },' >> capacitor.config.json
-            echo '  "android": { "allowMixedContent": true }' >> capacitor.config.json
-          else
-            echo '  "server": { "androidScheme": "https", "url": "${{ github.event.inputs.WEB_URL }}" }' >> capacitor.config.json
-          fi
-          echo '}' >> capacitor.config.json
-          
-          # Ek dummy web directory banata hai
           mkdir -p www
-          echo "<html><body></body></html>" > www/index.html
+          echo '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"></head><body></body></html>' > www/index.html
 
-      - name: Initialize Capacitor and Sync Android
+      # ---------- CAPACITOR INIT ----------
+      - name: Init & Configure Capacitor
+        shell: bash
+        run: |
+          npx cap init "${{ github.event.inputs.APP_NAME }}" "$APP_ID" --web-dir "www"
+          npx cap config set server.url "$WEB_URL"
+          npx cap config set server.androidScheme "https"
+          npx cap config set android.allowMixedContent "${{ github.event.inputs.ALLOW_MIXED_CONTENT }}"
+
+      - name: Add Android platform & Sync
+        shell: bash
         run: |
           npx cap add android
           npx cap sync android
 
-      - name: Update Android Project Versions
+      # ---------- ENFORCE SDK LEVELS ----------
+      - name: Force SDK levels (target/compile/min)
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE_VARS="android/variables.gradle"
+          if [ -f "$FILE_VARS" ]; then
+            sed -i "s/compileSdkVersion *= *[0-9]\+/compileSdkVersion = $TARGET_SDK/" "$FILE_VARS"
+            sed -i "s/targetSdkVersion *= *[0-9]\+/targetSdkVersion = $TARGET_SDK/" "$FILE_VARS"
+            sed -i "s/minSdkVersion *= *[0-9]\+/minSdkVersion = $MIN_SDK/" "$FILE_VARS"
+          else
+            sed -i "s/compileSdkVersion [0-9]\+/compileSdkVersion $TARGET_SDK/" android/app/build.gradle || true
+            sed -i "s/targetSdkVersion [0-9]\+/targetSdkVersion $TARGET_SDK/" android/app/build.gradle || true
+            sed -i "s/minSdkVersion [0-9]\+/minSdkVersion $MIN_SDK/" android/app/build.gradle || true
+          fi
+
+      - name: Set App Version in Gradle
+        shell: bash
         run: |
           GRADLE_FILE="android/app/build.gradle"
-          # Version Name aur Code set karta hai
-          sed -i 's/versionName ".*"/versionName "${{ github.event.inputs.VERSION_NAME }}"/' $GRADLE_FILE
-          sed -i 's/versionCode.*/versionCode ${{ github.event.inputs.VERSION_CODE }}/' $GRADLE_FILE
-          # Compile aur Target SDK set karta hai
-          sed -i 's/compileSdkVersion.*/compileSdkVersion ${{ github.event.inputs.COMPILE_SDK }}/' $GRADLE_FILE
-          sed -i 's/targetSdkVersion.*/targetSdkVersion ${{ github.event.inputs.TARGET_SDK }}/' $GRADLE_FILE
+          sed -i "s/versionName \".*\"/versionName \"$VERSION_NAME\"/" "$GRADLE_FILE"
+          sed -i "s/versionCode .*/versionCode $VERSION_CODE/" "$GRADLE_FILE"
 
-      - name: Decode Keystore
-        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > android/app/release-key.jks
-
-      - name: Build Signed App Bundle (AAB) and APK
-        working-directory: android
+      # ---------- KEYSTORE ----------
+      - name: Decode Keystore (scoped secret)
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        shell: bash
         run: |
-          chmod +x./gradlew
-          # AAB (Play Store ke liye) banayein
-         ./gradlew bundleRelease \
-            -Pandroid.injected.signing.store.file=$PWD/app/release-key.jks \
-            -Pandroid.injected.signing.store.password="${{ secrets.KEYSTORE_PASSWORD }}" \
-            -Pandroid.injected.signing.key.alias="${{ secrets.KEY_ALIAS }}" \
-            -Pandroid.injected.signing.key.password="${{ secrets.KEY_PASSWORD }}"
-          
-          # APK (testing ke liye) banayein
-         ./gradlew assembleRelease \
-            -Pandroid.injected.signing.store.file=$PWD/app/release-key.jks \
-            -Pandroid.injected.signing.store.password="${{ secrets.KEYSTORE_PASSWORD }}" \
-            -Pandroid.injected.signing.key.alias="${{ secrets.KEY_ALIAS }}" \
-            -Pandroid.injected.signing.key.password="${{ secrets.KEY_PASSWORD }}"
+          set -euo pipefail
+          base64 -d <<<"$KEYSTORE_BASE64" > android/release-key.jks
+          keytool -list -v -keystore android/release-key.jks -storepass "$KEYSTORE_PASSWORD" >/dev/null 2>&1 || { echo "Keystore verification failed"; exit 1; }
 
-      - name: Clean up Keystore
-        if: always() # Yah hamesha chalega, bhale hi build fail ho jaaye
-        run: rm -f android/app/release-key.jks
+      # ---------- BUILD ----------
+      - name: Build Signed AAB and APK
+        working-directory: android
+        shell: bash
+        env:
+          STORE_FILE: $PWD/release-key.jks
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon clean
+          ./gradlew --no-daemon bundleRelease \
+            -Pandroid.injected.signing.store.file="$STORE_FILE" \
+            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PASSWORD"
+          ./gradlew --no-daemon assembleRelease \
+            -Pandroid.injected.signing.store.file="$STORE_FILE" \
+            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PASSWORD"
 
-      - name: Upload AAB (Play Store Ready)
+      - name: Validate AAB Size (<4GB)
+        shell: bash
+        run: |
+          AAB="$(ls android/app/build/outputs/bundle/release/*.aab | head -n1)"
+          [ -z "$AAB" ] && echo "No AAB found" && exit 1
+          SIZE_BYTES=$(stat -c%s "$AAB")
+          LIMIT=$((4*1024*1024*1024))
+          if [ "$SIZE_BYTES" -ge "$LIMIT" ]; then
+            echo "AAB is >= 4GB limit ($SIZE_BYTES bytes)"; exit 1
+          fi
+
+      # ---------- ARTIFACTS ----------
+      - name: Upload AAB (Play Store ready)
         uses: actions/upload-artifact@v4
         with:
-          name: app-release-aab
+          name: aab-${{ env.VERSION_NAME }}-${{ env.VERSION_CODE }}
           path: android/app/build/outputs/bundle/release/*.aab
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Upload APK (for testing)
         uses: actions/upload-artifact@v4
         with:
-          name: app-release-apk
+          name: apk-${{ env.VERSION_NAME }}-${{ env.VERSION_CODE }}
           path: android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      # ---------- OPTIONAL WEBHOOK ----------
+      - name: Notify Make.com Webhook (optional)
+        shell: bash
+        env:
+          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
+          APP_ID: ${{ env.APP_ID }}
+          VERSION_NAME: ${{ env.VERSION_NAME }}
+          VERSION_CODE: ${{ env.VERSION_CODE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MAKE_WEBHOOK_URL:-}" ]; then
+            echo "Skipping webhook: MAKE_WEBHOOK_URL not set."
+            exit 0
+          fi
+          PAYLOAD="{\"appId\":\"$APP_ID\",\"versionName\":\"$VERSION_NAME\",\"versionCode\":\"$VERSION_CODE\",\"status\":\"success\"}"
+          for i in {1..3}; do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$MAKE_WEBHOOK_URL" || true)
+            if [ "$code" = "200" ] || [ "$code" = "202" ]; then
+              echo "Webhook delivered (attempt $i)"
+              exit 0
+            fi
+            echo "Webhook attempt $i failed (HTTP $code). Retrying..."
+            sleep 3
+          done
+          echo "Webhook failed after retries (non-blocking)"
+
+      - name: Secure Cleanup
+        if: always()
+        shell: bash
+        run: rm -f android/release-key.jks || true
