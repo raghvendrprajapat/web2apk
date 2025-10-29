@@ -1,4 +1,3 @@
-# .github/workflows/build-web-android.yml
 name: Build Web ➜ Signed Android (APK & AAB)
 
 on:
@@ -7,15 +6,15 @@ on:
       APP_NAME:
         description: "App name shown to users"
         required: true
-        default: "Brandforge Generator"
+        default: "My Web2App"
       APP_ID:
         description: "Package ID (e.g. com.example.app)"
         required: true
-        default: "com.brandforge.generator"
+        default: "com.example.web2app"
       WEB_URL:
         description: "Your live web URL (https://...)"
         required: true
-        default: "https://brandforge-generator.lovable.app"
+        default: "https://example.com"
       VERSION_NAME:
         description: "Public version name"
         required: true
@@ -104,19 +103,17 @@ jobs:
         set -euo pipefail
 
         if [[ -f package.json ]]; then
-          echo "package.json found – installing dependencies"
+          echo "Package.json found – installing deps"
           if [[ -f package-lock.json ]]; then
             npm ci
           else
             npm install
           fi
 
-          # Run a build script only if it exists in package.json
           if npm run | grep -q " build"; then
             npm run build
           fi
 
-          # Detect the build output directory
           if [[ -d dist ]]; then
             echo "WEB_BUILD_DIR=dist" >> $GITHUB_ENV
           elif [[ -d build ]]; then
@@ -176,7 +173,7 @@ jobs:
         # Ensure Capacitor deps
         npm install @capacitor/core @capacitor/cli @capacitor/android --save-dev
 
-        # Initialise project if this is the first run
+        # Init if first time
         if [[ ! -f capacitor.config.* ]]; then
           npx cap init "$APP_NAME" "$APP_ID" --web-dir="$WEB_BUILD_DIR"
         fi
@@ -200,16 +197,15 @@ jobs:
         export default config;
 CONFIG
 
-        # Install optional plugins based on user selection
+        # Optional plugins
         case "$PLUGINS" in
-          camera)                 npm i @capacitor/camera ;;
+          camera)                 npm i @capacitor/camera ;; 
           push-notifications)     npm i @capacitor/push-notifications ;;
           location)               npm i @capacitor/geolocation ;;
           camera_and_push)        npm i @capacitor/camera @capacitor/push-notifications ;;
           all)                    npm i @capacitor/camera @capacitor/push-notifications @capacitor/geolocation ;;
         esac
 
-        # Add and sync the Android platform
         npx cap add android || true
         npx cap sync android
 
@@ -281,4 +277,3 @@ SNIPPET
       with:
         name: signed-release
         path: signed_out/
-        
