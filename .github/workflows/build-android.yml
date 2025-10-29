@@ -20,7 +20,7 @@ on:
         required: true
         default: "1.0.0"
       VERSION_CODE:
-        description: "Internal version code (must +1 every release)"
+        description: "Internal version code (must +1 each upload)"
         required: true
         default: "1"
       TARGET_SDK:
@@ -32,7 +32,7 @@ on:
         required: true
         default: "22"
       ALLOW_MIXED_CONTENT:
-        description: "Allow http:// (true/false)"
+        description: "Allow http:// ? (true/false)"
         required: true
         default: "false"
       PLUGINS:
@@ -67,7 +67,7 @@ jobs:
       ALLOW_MIXED_CONTENT: ${{ github.event.inputs.ALLOW_MIXED_CONTENT }}
       PLUGINS: ${{ github.event.inputs.PLUGINS }}
 
-      # signing secrets (SET THESE IN REPO -> Settings -> Secrets and variables -> Actions)
+      # You MUST define these 4 in Repo -> Settings -> Secrets and variables -> Actions
       KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
       KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
       KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
@@ -76,115 +76,99 @@ jobs:
       GRADLE_OPTS: "-Dorg.gradle.jvmargs='-Xmx3g -XX:+UseParallelGC' -Dorg.gradle.daemon=false"
 
     steps:
-      # 1. Checkout source
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # 2. Setup Java (Gradle/Android needs JDK 17)
-      - name: Setup Java
+      - name: Setup Java (JDK 17 for Android/Gradle)
         uses: actions/setup-java@v4
         with:
           distribution: "temurin"
           java-version: "17"
 
-      # 3. Setup Node (NO cache so we don't require lockfile)
-      - name: Setup Node.js
+      - name: Setup Node.js (no cache, so no lockfile requirement)
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      # 4. Prepare web assets + minimal project if needed
-      #
-      # This step does ALL of this:
-      # - if package.json exists:
-      #       install deps (npm ci if lockfile exists, else npm install)
-      #       try npm run build (if exists)
-      #       pick dist/ or build/ as webDir
-      # - if package.json NOT exists:
-      #       create minimal package.json
-      #       install Capacitor deps
-      #       create minimal_www/index.html (simple loader)
-      #
-      # It always exports WEB_BUILD_DIR into $GITHUB_ENV
-      - name: Prepare Web / Node project
+      # Step 1: Prepare web content and basic Node project
+      # - If repo already has package.json, we install and (if available) build.
+      # - If repo has nothing (just empty / just URL use case), we create minimal project and a dummy web folder.
+      - name: Prepare web build directory
         shell: bash
         run: |
           set -euo pipefail
 
           if [ -f package.json ]; then
-            echo "[INFO] Found package.json, treating repo as existing web app."
+            echo "[INFO] Found package.json"
 
             if [ -f package-lock.json ]; then
               echo "[INFO] Using npm ci"
               npm ci
             else
-              echo "[WARN] No package-lock.json, using npm install"
+              echo "[INFO] No package-lock.json, using npm install"
               npm install
             fi
 
-            # Try to build if build script exists
+            # If "npm run build" exists, run it
             if npm run | grep -q " build"; then
               echo "[INFO] Running npm run build"
-              npm run build || { echo "[ERROR] npm run build failed"; exit 1; }
+              npm run build
             else
-              echo "[WARN] No build script found in package.json, skipping build"
+              echo "[WARN] No build script found in package.json"
             fi
 
-            # Detect output dir
+            # Detect output directory for web assets
             if [ -d "dist" ]; then
-              echo "WEB_BUILD_DIR=dist" >> $GITHUB_ENV
+              WEB_BUILD_DIR="dist"
             elif [ -d "build" ]; then
-              echo "WEB_BUILD_DIR=build" >> $GITHUB_ENV
+              WEB_BUILD_DIR="build"
+            elif [ -d "public" ]; then
+              WEB_BUILD_DIR="public"
             else
-              echo "[WARN] Could not detect dist/ or build/. Using public/ or current folder."
-              if [ -d "public" ]; then
-                echo "WEB_BUILD_DIR=public" >> $GITHUB_ENV
-              else
-                mkdir -p minimal_www
-                echo "<!doctype html><html><body><p>Loading...</p></body></html>" > minimal_www/index.html
-                echo "WEB_BUILD_DIR=minimal_www" >> $GITHUB_ENV
-              fi
+              echo "[WARN] No dist/build/public found, creating minimal_www/"
+              mkdir -p minimal_www
+              echo "<!doctype html><html><body><p>Loading...</p></body></html>" > minimal_www/index.html
+              WEB_BUILD_DIR="minimal_www"
             fi
-
-            # Ensure Capacitor deps exist
-            npm install @capacitor/core @capacitor/cli @capacitor/android --save-dev
-
           else
             echo "[INFO] No package.json found. Creating minimal Capacitor project."
             npm init -y
 
-            # Add Capacitor core/CLI/Android
+            # Add Capacitor core/cli/android
             npm install @capacitor/core @capacitor/cli @capacitor/android --save-dev
 
-            # Make a tiny web folder with loader screen
             mkdir -p minimal_www
-            cat > minimal_www/index.html <<EOF
+            cat > minimal_www/index.html <<'EOF_HTML'
 <!doctype html>
 <html>
   <head>
     <meta charset="utf-8"/>
     <meta name="viewport" content="width=device-width,initial-scale=1"/>
-    <title>${APP_NAME}</title>
+    <title>Loading App...</title>
   </head>
   <body style="font-family:sans-serif;text-align:center;padding-top:3rem;">
-    <p>Loading ${APP_NAME} ...</p>
+    <p>Loading app...</p>
   </body>
 </html>
-EOF
+EOF_HTML
 
-            echo "WEB_BUILD_DIR=minimal_www" >> $GITHUB_ENV
+            WEB_BUILD_DIR="minimal_www"
           fi
 
-          echo "[INFO] WEB_BUILD_DIR set to $(cat $GITHUB_ENV | grep WEB_BUILD_DIR)"
+          echo "WEB_BUILD_DIR=$WEB_BUILD_DIR" >> $GITHUB_ENV
+          echo "[INFO] WEB_BUILD_DIR is $WEB_BUILD_DIR"
 
-      # 5. Validate critical inputs early (fail fast if wrong)
+          # Make sure Capacitor deps exist even if package.json was already there
+          npm install @capacitor/core @capacitor/cli @capacitor/android --save-dev
+
+      # Step 2: Validate inputs + make sure signing secrets exist
       - name: Validate inputs & secrets
         shell: bash
         run: |
           set -euo pipefail
           echo "## Input Validation" >> "$GITHUB_STEP_SUMMARY"
 
-          # validate APP_ID format (com.example.app)
+          # Check APP_ID format like com.example.app
           if [[ ! "$APP_ID" =~ ^[a-z]+([a-z0-9_]*)(\.[a-z][a-z0-9_]*)+$ ]]; then
             echo "❌ APP_ID invalid: $APP_ID" | tee -a "$GITHUB_STEP_SUMMARY"
             exit 1
@@ -202,7 +186,7 @@ EOF
             exit 1
           fi
 
-          # signing secrets must exist
+          # Signing secrets check
           if [[ -z "${KEYSTORE_BASE64:-}" || -z "${KEYSTORE_PASSWORD:-}" || -z "${KEY_ALIAS:-}" || -z "${KEY_PASSWORD:-}" ]]; then
             echo "❌ Missing signing secrets. You MUST set ANDROID_KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD in repo secrets." | tee -a "$GITHUB_STEP_SUMMARY"
             exit 1
@@ -210,7 +194,7 @@ EOF
 
           echo "✔ Inputs look OK" >> "$GITHUB_STEP_SUMMARY"
 
-      # 6. Restore keystore file from Base64 secret
+      # Step 3: Restore keystore from Base64
       - name: Restore signing keystore
         shell: bash
         run: |
@@ -218,31 +202,21 @@ EOF
           echo "$KEYSTORE_BASE64" | base64 -d > android-release.keystore
           ls -l android-release.keystore
 
-      # 7. Create / Update Capacitor config and Android platform
-      #
-      # We now have:
-      #   - WEB_BUILD_DIR in $GITHUB_ENV
-      #   - Capacitor deps installed
-      #
-      # We'll:
-      #   - init Capacitor if missing
-      #   - write capacitor.config.ts (force overwrite for consistency)
-      #   - install optional plugins
-      #   - add android platform
-      #   - sync web to android
+      # Step 4: Configure Capacitor project and Android platform
       - name: Configure Capacitor & Android project
         shell: bash
         run: |
           set -euo pipefail
+
           source $GITHUB_ENV
 
-          # init Capacitor if no config yet
+          # If capacitor project not init yet, init it
           if [ ! -f "capacitor.config.ts" ] && [ ! -f "capacitor.config.json" ]; then
             npx cap init "$APP_NAME" "$APP_ID" --web-dir="${WEB_BUILD_DIR}"
           fi
 
-          # overwrite capacitor.config.ts every run (single source of truth)
-          cat > capacitor.config.ts <<EOF
+          # Overwrite capacitor.config.ts: always regenerate
+          cat > capacitor.config.ts <<EOF_TS
 import { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
@@ -260,9 +234,9 @@ const config: CapacitorConfig = {
 };
 
 export default config;
-EOF
+EOF_TS
 
-          # install requested plugins
+          # Optional plugins
           case "$PLUGINS" in
             "none")
               echo "[INFO] No extra plugins requested"
@@ -288,35 +262,28 @@ EOF
               ;;
           esac
 
-          # add android platform if not present
+          # Add android platform if missing, then sync
           npx cap add android || true
           npx cap sync android
 
-      # 8. Make sure Android SDK / build-tools exist for TARGET_SDK.
-      #    Runners usually already have sdkmanager, but we try to install what we need.
+      # Step 5: Make sure Android SDK pieces are available
       - name: Ensure Android SDK components
         shell: bash
         run: |
           set -euo pipefail
 
-          # prefer ANDROID_SDK_ROOT provided by runner
           export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
           echo "ANDROID_HOME is $ANDROID_HOME"
 
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
 
-          # Try installing required platforms/build-tools.
-          # Don't fail hard if specific subversion doesn't exist, just best-effort.
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
             "platform-tools" \
             "platforms;android-${TARGET_SDK}" \
             "build-tools;${TARGET_SDK}.0.0" \
             >/dev/null 2>&1 || true
 
-      # 9. Patch Gradle config:
-      #    - set versionCode, versionName, minSdk, targetSdk, compileSdk
-      #    - allow cleartextTraffic if requested
-      #    - copy keystore and inject signingConfigs (if not already there)
+      # Step 6: Patch Gradle for versionCode, versionName, SDK levels, signing
       - name: Patch Android Gradle for release/signing
         shell: bash
         working-directory: android
@@ -326,11 +293,9 @@ EOF
 
           cp ../android-release.keystore app/release.keystore
 
-          # figure out Groovy vs Kotlin DSL
           APP_GRADLE_GROOVY="app/build.gradle"
           APP_GRADLE_KTS="app/build.gradle.kts"
 
-          TARGET_FILE=""
           if [ -f "$APP_GRADLE_GROOVY" ]; then
             TARGET_FILE="$APP_GRADLE_GROOVY"
           elif [ -f "$APP_GRADLE_KTS" ]; then
@@ -342,7 +307,7 @@ EOF
 
           echo "[INFO] Patching $TARGET_FILE"
 
-          # versionCode / versionName
+          # versionCode / versionName (Groovy or KTS styles)
           sed -i "s/versionCode [0-9]\\+/versionCode ${VERSION_CODE}/" "$TARGET_FILE" || true
           sed -i "s/versionName \".*\"/versionName \"${VERSION_NAME}\"/" "$TARGET_FILE" || true
           sed -i "s/versionCode = [0-9]\\+/versionCode = ${VERSION_CODE}/" "$TARGET_FILE" || true
@@ -357,7 +322,7 @@ EOF
           sed -i "s/targetSdk = [0-9]\\+/targetSdk = ${TARGET_SDK}/" "$TARGET_FILE" || true
           sed -i "s/compileSdk = [0-9]\\+/compileSdk = ${TARGET_SDK}/" "$TARGET_FILE" || true
 
-          # allow cleartext if needed
+          # allow cleartextTraffic if requested
           if [ "${ALLOW_MIXED_CONTENT}" = "true" ]; then
             MANIFEST="app/src/main/AndroidManifest.xml"
             if [ -f "$MANIFEST" ]; then
@@ -367,52 +332,60 @@ EOF
             fi
           fi
 
-          # inject signing config if not present
+          # Inject signingConfig only if not already there
           if ! grep -q "signingConfigs" "$TARGET_FILE"; then
             if [[ "$TARGET_FILE" == *".kts" ]]; then
-              # Kotlin DSL
-              sed -i "/android\s*{/a \\
-                  signingConfigs {\n\
-                      create(\"release\") {\n\
-                          storeFile = file(\"release.keystore\")\n\
-                          storePassword = System.getenv(\"KEYSTORE_PASSWORD\")\n\
-                          keyAlias = System.getenv(\"KEY_ALIAS\")\n\
-                          keyPassword = System.getenv(\"KEY_PASSWORD\")\n\
-                      }\n\
-                  }\n\
-                  buildTypes {\n\
-                      getByName(\"release\") {\n\
-                          signingConfig = signingConfigs.getByName(\"release\")\n\
-                          isMinifyEnabled = false\n\
-                          isShrinkResources = false\n\
-                          isDebuggable = false\n\
-                      }\n\
-                  }\n" "$TARGET_FILE"
+              # Kotlin DSL append
+              cat >> "$TARGET_FILE" <<'EOF_SIGN_KTS'
+
+android {
+    signingConfigs {
+        create("release") {
+            storeFile = file("release.keystore")
+            storePassword = System.getenv("KEYSTORE_PASSWORD")
+            keyAlias = System.getenv("KEY_ALIAS")
+            keyPassword = System.getenv("KEY_PASSWORD")
+        }
+    }
+    buildTypes {
+        getByName("release") {
+            signingConfig = signingConfigs.getByName("release")
+            isMinifyEnabled = false
+            isShrinkResources = false
+            isDebuggable = false
+        }
+    }
+}
+EOF_SIGN_KTS
             else
-              # Groovy DSL
-              sed -i "/android\s*{/a \\
-                  signingConfigs {\n\
-                      release {\n\
-                          storeFile file(\"release.keystore\")\n\
-                          storePassword System.getenv(\"KEYSTORE_PASSWORD\")\n\
-                          keyAlias System.getenv(\"KEY_ALIAS\")\n\
-                          keyPassword System.getenv(\"KEY_PASSWORD\")\n\
-                      }\n\
-                  }\n\
-                  buildTypes {\n\
-                      release {\n\
-                          signingConfig signingConfigs.release\n\
-                          minifyEnabled false\n\
-                          shrinkResources false\n\
-                          debuggable false\n\
-                      }\n\
-                  }\n" "$TARGET_FILE"
+              # Groovy DSL append
+              cat >> "$TARGET_FILE" <<'EOF_SIGN_GROOVY'
+
+android {
+    signingConfigs {
+        release {
+            storeFile file("release.keystore")
+            storePassword System.getenv("KEYSTORE_PASSWORD")
+            keyAlias System.getenv("KEY_ALIAS")
+            keyPassword System.getenv("KEY_PASSWORD")
+        }
+    }
+    buildTypes {
+        release {
+            signingConfig signingConfigs.release
+            minifyEnabled false
+            shrinkResources false
+            debuggable false
+        }
+    }
+}
+EOF_SIGN_GROOVY
             fi
           else
-            echo "[INFO] signingConfigs already present, not injecting."
+            echo "[INFO] signingConfigs already exists, not appending."
           fi
 
-      # 10. Build release bundle/apk with Gradle
+      # Step 7: Build release AAB + APK
       - name: Build release (AAB/APK)
         shell: bash
         working-directory: android
@@ -426,25 +399,25 @@ EOF
           cp app/build/outputs/bundle/release/*.aab ../signed_output/ || true
           cp app/build/outputs/apk/release/*.apk ../signed_output/ || true
 
-      # 11. Upload artifacts back to GitHub
+      # Step 8: Upload artifacts
       - name: Upload Signed AAB/APK
         uses: actions/upload-artifact@v4
         with:
           name: signed-release-artifacts
           path: signed_output/
 
-      # 12. Nice summary
+      # Step 9: Summary
       - name: Summary / Next steps
         if: always()
         shell: bash
         run: |
-          echo "### ✅ Build attempt finished" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Build finished" >> $GITHUB_STEP_SUMMARY
           echo "- Check artifact 'signed-release-artifacts' for:" >> $GITHUB_STEP_SUMMARY
-          echo "  • app-release.aab  (upload this to Play Console → Internal testing)" >> $GITHUB_STEP_SUMMARY
+          echo "  • app-release.aab  (upload this to Play Console → Internal testing first)" >> $GITHUB_STEP_SUMMARY
           echo "  • app-release.apk  (install on device for testing)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "versionName: $VERSION_NAME" >> $GITHUB_STEP_SUMMARY
           echo "versionCode: $VERSION_CODE" >> $GITHUB_STEP_SUMMARY
-          echo "appId / packageName: $APP_ID" >> $GITHUB_STEP_SUMMARY
+          echo "packageName (appId): $APP_ID" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Remember: In Play Console, versionCode must always go UP for every new upload." >> $GITHUB_STEP_SUMMARY
+          echo "REMEMBER: Every new Play upload needs a HIGHER versionCode." >> $GITHUB_STEP_SUMMARY
