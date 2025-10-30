@@ -1,10 +1,10 @@
-name: Build Web ➜ Signed Android (APK & AAB)
+name: Build Web to Signed Android
 
 on:
   workflow_dispatch:
     inputs:
       APP_NAME:
-        description: "App name shown to users"
+        description: "App name"
         required: true
         default: "My Web2App"
       APP_ID:
@@ -12,15 +12,15 @@ on:
         required: true
         default: "com.example.web2app"
       WEB_URL:
-        description: "Your live web URL (https://...)"
+        description: "Live URL (must be https:// unless you allow http)"
         required: true
         default: "https://example.com"
       VERSION_NAME:
-        description: "Public version name"
+        description: "Public version (e.g. 1.0.0)"
         required: true
         default: "1.0.0"
       VERSION_CODE:
-        description: "Integer; must increase every upload"
+        description: "Integer. Must increase every Play upload"
         required: true
         default: "1"
       TARGET_SDK:
@@ -36,16 +36,15 @@ on:
         required: true
         default: "false"
       PLUGINS:
-        description: "Extra native plugins"
-        type: choice
+        description: "Extra native plugins to include"
         required: true
+        type: choice
         default: "none"
         options:
           - "none"
           - "camera"
-          - "push-notifications"
+          - "push"
           - "location"
-          - "camera_and_push"
           - "all"
 
 permissions:
@@ -54,10 +53,9 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 40
 
     env:
-      # Inputs
       APP_NAME: ${{ github.event.inputs.APP_NAME }}
       APP_ID: ${{ github.event.inputs.APP_ID }}
       WEB_URL: ${{ github.event.inputs.WEB_URL }}
@@ -68,212 +66,258 @@ jobs:
       ALLOW_MIXED_CONTENT: ${{ github.event.inputs.ALLOW_MIXED_CONTENT }}
       PLUGINS: ${{ github.event.inputs.PLUGINS }}
 
-      # Signing secrets (add these in repo → Settings → Secrets and variables → Actions)
-      KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      # secrets (must exist in repo → Settings → Secrets and variables → Actions)
+      KEYSTORE_BASE64:   ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
       KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-      KEY_ALIAS:        ${{ secrets.KEY_ALIAS }}
-      KEY_PASSWORD:     ${{ secrets.KEY_PASSWORD }}
-
-      GRADLE_OPTS: "-Dorg.gradle.jvmargs='-Xmx3g -XX:+UseParallelGC' -Dorg.gradle.daemon=false"
+      KEY_ALIAS:         ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD:      ${{ secrets.KEY_PASSWORD }}
 
     steps:
-    # -------------------------------------------------
-    # 0. Source checkout & toolchains
-    # -------------------------------------------------
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-    - name: Set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        distribution: temurin
-        java-version: 17
+      # use Java 21 (Capacitor/Gradle wants source release 21)
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
 
-    - name: Set up Node 20
-      uses: actions/setup-node@v4
-      with:
-        node-version: 20
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
-    # -------------------------------------------------
-    # 1. Prepare web assets (works with OR without package.json)
-    # -------------------------------------------------
-    - name: Prepare web build dir
-      shell: bash
-      run: |
-        set -euo pipefail
+      #################################################################
+      # 1. Prepare webDir (works with OR without package.json)
+      #################################################################
+      - name: Prepare webDir
+        shell: bash
+        run: |
+          set -euo pipefail
 
-        if [[ -f package.json ]]; then
-          echo "Package.json found – installing deps"
-          if [[ -f package-lock.json ]]; then
-            npm ci
+          # if repo is already a web project
+          if [ -f package.json ]; then
+            if [ -f package-lock.json ]; then
+              npm ci
+            else
+              npm install
+            fi
+
+            # build if build script exists
+            if npm run | grep -q " build"; then
+              npm run build || true
+            fi
+
+            # try common build folders
+            for d in dist build public; do
+              if [ -d "$d" ]; then
+                echo "WEB_BUILD_DIR=$d" >> $GITHUB_ENV
+                break
+              fi
+            done
+          fi
+
+          # if still no WEB_BUILD_DIR => create minimal html
+          if ! grep -q WEB_BUILD_DIR $GITHUB_ENV 2>/dev/null; then
+            mkdir -p minimal_www
+            printf '<!doctype html><html><body style="font-family:sans-serif;text-align:center;padding-top:2rem;">Loading…</body></html>\n' > minimal_www/index.html
+            echo "WEB_BUILD_DIR=minimal_www" >> $GITHUB_ENV
+          fi
+
+          # make sure capacitor deps exist
+          npm install -D @capacitor/core @capacitor/cli @capacitor/android
+
+      #################################################################
+      # 2. Validate inputs + secrets before wasting time
+      #################################################################
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # APP_ID format check
+          if [[ ! "$APP_ID" =~ ^[a-z]+([a-z0-9_]*)(\.[a-z][a-z0-9_]*)+$ ]]; then
+            echo "❌ APP_ID invalid: $APP_ID"
+            exit 1
+          fi
+
+          # VERSION_CODE must be integer
+          if ! [[ "$VERSION_CODE" =~ ^[0-9]+$ ]]; then
+            echo "❌ VERSION_CODE must be integer"
+            exit 1
+          fi
+
+          # HTTPS rule unless ALLOW_MIXED_CONTENT=true
+          if [[ "$ALLOW_MIXED_CONTENT" != "true" && ! "$WEB_URL" =~ ^https:// ]]; then
+            echo "❌ WEB_URL must start with https:// (or set ALLOW_MIXED_CONTENT=true)"
+            exit 1
+          fi
+
+          # secrets exist?
+          for var in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!var:-}" ]; then
+              echo "❌ Missing secret: $var"
+              exit 1
+            fi
+          done
+
+      #################################################################
+      # 3. Restore keystore from Base64
+      #################################################################
+      - name: Restore keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "$KEYSTORE_BASE64" | base64 -d > android.keystore
+          ls -l android.keystore
+
+      #################################################################
+      # 4. Init Capacitor project and generate capacitor.config.json
+      #################################################################
+      - name: Configure Capacitor
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "WEB_BUILD_DIR currently set to: $WEB_BUILD_DIR"
+
+          # Init Capacitor (no --npm-client flag because older CLI doesn't like it)
+          npx cap init "$APP_NAME" "$APP_ID" --web-dir="$WEB_BUILD_DIR" || true
+
+          # Generate capacitor.config.json (not .ts, so no TypeScript needed)
+          printf '{\n' > capacitor.config.json
+          printf '  "appId": "%s",\n' "$APP_ID" >> capacitor.config.json
+          printf '  "appName": "%s",\n' "$APP_NAME" >> capacitor.config.json
+          printf '  "webDir": "%s",\n' "$WEB_BUILD_DIR" >> capacitor.config.json
+          printf '  "bundledWebRuntime": false,\n' >> capacitor.config.json
+          printf '  "server": {\n' >> capacitor.config.json
+          printf '    "url": "%s",\n' "$WEB_URL" >> capacitor.config.json
+          if [ "$ALLOW_MIXED_CONTENT" = "true" ]; then
+            printf '    "cleartext": true\n' >> capacitor.config.json
           else
-            npm install
+            printf '    "cleartext": false\n' >> capacitor.config.json
           fi
-
-          if npm run | grep -q " build"; then
-            npm run build
-          fi
-
-          if [[ -d dist ]]; then
-            echo "WEB_BUILD_DIR=dist" >> $GITHUB_ENV
-          elif [[ -d build ]]; then
-            echo "WEB_BUILD_DIR=build" >> $GITHUB_ENV
+          printf '  },\n' >> capacitor.config.json
+          printf '  "android": {\n' >> capacitor.config.json
+          if [ "$ALLOW_MIXED_CONTENT" = "true" ]; then
+            printf '    "allowMixedContent": true\n' >> capacitor.config.json
           else
-            echo "WEB_BUILD_DIR=public" >> $GITHUB_ENV
+            printf '    "allowMixedContent": false\n' >> capacitor.config.json
           fi
-        else
-          echo "No package.json – creating minimal project"
-          npm init -y
-          npm install @capacitor/core @capacitor/cli @capacitor/android --save-dev
-          mkdir -p minimal_www
-          printf '<!doctype html><html><body><p>Loading…</p></body></html>' > minimal_www/index.html
-          echo "WEB_BUILD_DIR=minimal_www" >> $GITHUB_ENV
-        fi
+          printf '  }\n' >> capacitor.config.json
+          printf '}\n' >> capacitor.config.json
 
-    # -------------------------------------------------
-    # 2. Input & secret validation
-    # -------------------------------------------------
-    - name: Validate inputs
-      shell: bash
-      run: |
-        set -euo pipefail
+          # Install optional plugins
+          if [ "$PLUGINS" = "camera" ]; then
+            npm install @capacitor/camera
+          elif [ "$PLUGINS" = "push" ]; then
+            npm install @capacitor/push-notifications
+          elif [ "$PLUGINS" = "location" ]; then
+            npm install @capacitor/geolocation
+          elif [ "$PLUGINS" = "all" ]; then
+            npm install @capacitor/camera @capacitor/push-notifications @capacitor/geolocation
+          fi
 
-        [[ "$APP_ID" =~ ^[a-z]+([a-z0-9_]*)(\.[a-z][a-z0-9_]*)+$ ]] \
-          || { echo "Bad APP_ID"; exit 1; }
+          # Add Android platform and sync
+          npx cap add android || true
+          npx cap sync android
 
-        [[ "$VERSION_CODE" =~ ^[0-9]+$ ]] \
-          || { echo "VERSION_CODE must be integer"; exit 1; }
+      #################################################################
+      # 5. Patch Gradle for versioning, SDK levels, signing
+      #################################################################
+      - name: Patch Gradle
+        shell: bash
+        working-directory: android
+        run: |
+          set -euo pipefail
 
-        if [[ "$ALLOW_MIXED_CONTENT" != "true" && ! "$WEB_URL" =~ ^https:// ]]; then
-          echo "WEB_URL must start with https:// unless ALLOW_MIXED_CONTENT=true"; exit 1
-        fi
+          cp ../android.keystore app/release.keystore
 
-        for v in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
-          [[ -n "${!v:-}" ]] || { echo "Missing secret: $v"; exit 1; }
-        done
+          if [ -f app/build.gradle ]; then
+            FILE="app/build.gradle"
+          else
+            FILE="app/build.gradle.kts"
+          fi
 
-    # -------------------------------------------------
-    # 3. Recreate keystore from secret
-    # -------------------------------------------------
-    - name: Restore keystore
-      shell: bash
-      run: |
-        set -euo pipefail
-        echo "$KEYSTORE_BASE64" | base64 -d > android-release.keystore
+          echo "Patching $FILE"
 
-    # -------------------------------------------------
-    # 4. Capacitor project + plugins
-    # -------------------------------------------------
-    - name: Configure Capacitor
-      shell: bash
-      run: |
-        set -euo pipefail
-        source $GITHUB_ENV
+          sed -i -E "s/versionCode[ =]+[0-9]+/versionCode $VERSION_CODE/" "$FILE" || true
+          sed -i -E "s/versionName[ =]+\"[^\"]+\"/versionName \"$VERSION_NAME\"/" "$FILE" || true
 
-        # Ensure Capacitor deps
-        npm install @capacitor/core @capacitor/cli @capacitor/android --save-dev
+          sed -i -E "s/minSdkVersion[ =]+[0-9]+/minSdkVersion $MIN_SDK/" "$FILE" || true
+          sed -i -E "s/minSdk[ =]+[0-9]+/minSdk $MIN_SDK/" "$FILE" || true
 
-        # Init if first time
-        if [[ ! -f capacitor.config.* ]]; then
-          npx cap init "$APP_NAME" "$APP_ID" --web-dir="$WEB_BUILD_DIR"
-        fi
+          sed -i -E "s/targetSdkVersion[ =]+[0-9]+/targetSdkVersion $TARGET_SDK/" "$FILE" || true
+          sed -i -E "s/targetSdk[ =]+[0-9]+/targetSdk $TARGET_SDK/" "$FILE" || true
 
-        # Always regenerate config for idempotency
-        cat > capacitor.config.ts <<'CONFIG'
-        import { CapacitorConfig } from '@capacitor/cli';
-        const config: CapacitorConfig = {
-          appId: process.env.APP_ID!,
-          appName: process.env.APP_NAME!,
-          webDir: process.env.WEB_BUILD_DIR!,
-          bundledWebRuntime: false,
-          server: {
-            url: process.env.WEB_URL!,
-            cleartext: process.env.ALLOW_MIXED_CONTENT === 'true'
-          },
-          android: {
-            allowMixedContent: process.env.ALLOW_MIXED_CONTENT === 'true'
-          }
-        };
-        export default config;
-CONFIG
+          sed -i -E "s/compileSdkVersion[ =]+[0-9]+/compileSdkVersion $TARGET_SDK/" "$FILE" || true
+          sed -i -E "s/compileSdk[ =]+[0-9]+/compileSdk $TARGET_SDK/" "$FILE" || true
 
-        # Optional plugins
-        case "$PLUGINS" in
-          camera)                 npm i @capacitor/camera ;; 
-          push-notifications)     npm i @capacitor/push-notifications ;;
-          location)               npm i @capacitor/geolocation ;;
-          camera_and_push)        npm i @capacitor/camera @capacitor/push-notifications ;;
-          all)                    npm i @capacitor/camera @capacitor/push-notifications @capacitor/geolocation ;;
-        esac
+          if ! grep -q "signingConfigs" "$FILE"; then
+            {
+              echo ""
+              echo "android {"
+              echo "    signingConfigs {"
+              echo "        release {"
+              echo "            storeFile file(\"release.keystore\")"
+              echo "            storePassword System.getenv(\"KEYSTORE_PASSWORD\")"
+              echo "            keyAlias      System.getenv(\"KEY_ALIAS\")"
+              echo "            keyPassword   System.getenv(\"KEY_PASSWORD\")"
+              echo "        }"
+              echo "    }"
+              echo "    buildTypes {"
+              echo "        release {"
+              echo "            signingConfig signingConfigs.release"
+              echo "            minifyEnabled false"
+              echo "            shrinkResources false"
+              echo "            debuggable false"
+              echo "        }"
+              echo "    }"
+              echo "}"
+            } >> "$FILE"
+          fi
 
-        npx cap add android || true
-        npx cap sync android
+          if [ "$ALLOW_MIXED_CONTENT" = "true" ]; then
+            MF="app/src/main/AndroidManifest.xml"
+            if [ -f "$MF" ]; then
+              if ! grep -q usesCleartextTraffic "$MF"; then
+                sed -i 's/<application /<application android:usesCleartextTraffic="true" /' "$MF"
+              fi
+            fi
+          fi
 
-    # -------------------------------------------------
-    # 5. Gradle signing & version patch
-    # -------------------------------------------------
-    - name: Patch Gradle & sign
-      shell: bash
-      working-directory: android
-      run: |
-        set -euo pipefail
+      #################################################################
+      # 6. Build release AAB+APK and upload artifacts separately
+      #################################################################
+      - name: Build release
+        shell: bash
+        working-directory: android
+        run: |
+          set -euo pipefail
+          ./gradlew clean :app:bundleRelease :app:assembleRelease
 
-        cp ../android-release.keystore app/release.keystore
+          # make output folders
+          mkdir -p ../out_aab
+          mkdir -p ../out_apk
 
-        FILE=$( [[ -f app/build.gradle ]] && echo app/build.gradle || echo app/build.gradle.kts )
+          # copy built files
+          cp app/build/outputs/bundle/release/*.aab ../out_aab/ || true
+          cp app/build/outputs/apk/release/*.apk ../out_apk/   || true
 
-        # Version & SDK tweaks
-        sed -i -E "s/versionCode[ =]+[0-9]+/versionCode $VERSION_CODE/"   "$FILE"
-        sed -i -E "s/versionName[ =]+\"[^\"]+\"/versionName \"$VERSION_NAME\"/" "$FILE"
-        sed -i -E "s/(minSdkVersion|minSdk[ =]+)[0-9]+/\1$MIN_SDK/"       "$FILE"
-        sed -i -E "s/(targetSdkVersion|targetSdk[ =]+)[0-9]+/\1$TARGET_SDK/" "$FILE"
-        sed -i -E "s/(compileSdkVersion|compileSdk[ =]+)[0-9]+/\1$TARGET_SDK/" "$FILE"
+          echo "=== AAB files ==="
+          ls -l ../out_aab || true
+          echo "=== APK files ==="
+          ls -l ../out_apk || true
 
-        # Inject signingConfig if missing
-        grep -q signingConfigs "$FILE" || cat >> "$FILE" <<'SNIPPET'
+      - name: Upload signed AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-aab
+          path: out_aab
 
-android {
-    signingConfigs {
-        release {
-            storeFile file("release.keystore")
-            storePassword System.getenv("KEYSTORE_PASSWORD")
-            keyAlias System.getenv("KEY_ALIAS")
-            keyPassword System.getenv("KEY_PASSWORD")
-        }
-    }
-    buildTypes {
-        release {
-            signingConfig signingConfigs.release
-            minifyEnabled false
-            shrinkResources false
-            debuggable false
-        }
-    }
-}
-SNIPPET
-
-        # Clear-text flag, if needed
-        if [[ "$ALLOW_MIXED_CONTENT" == "true" ]]; then
-          MANIFEST="app/src/main/AndroidManifest.xml"
-          grep -q usesCleartextTraffic "$MANIFEST" || \
-          sed -i 's/<application /<application android:usesCleartextTraffic="true" /' "$MANIFEST"
-        fi
-
-    # -------------------------------------------------
-    # 6. Build release & collect artifacts
-    # -------------------------------------------------
-    - name: Build AAB & APK
-      shell: bash
-      working-directory: android
-      run: |
-        set -euo pipefail
-        ./gradlew clean :app:bundleRelease :app:assembleRelease
-        mkdir -p ../signed_out
-        cp app/build/outputs/bundle/release/*.aab ../signed_out/
-        cp app/build/outputs/apk/release/*.apk    ../signed_out/
-
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: signed-release
-        path: signed_out/
+      - name: Upload signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-apk
+          path: out_apk
